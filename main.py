@@ -1,1961 +1,93 @@
-"""
-五子棋游戏 - PyQt5 版本
-AI: PVS+LMR + 固定数组置换表 + 专业权重棋型库 + 增强TSS(攻防) + GPU加速(可选) + 时间控制 + 开局库
-"""
-import sys
-import random
-import time
-import math
-import numpy as np
-# PyTorch 可选依赖：尝试导入，不可用时创建占位模块
-# 自动检测 GPU 类型：NVIDIA CUDA → Intel XPU → CPU 回退
-try:
-    import torch
-    import torch.nn.functional as F
-except (ImportError, Exception):
-    import types
-    torch = types.ModuleType('torch')
-    def _dummy_no_grad(fn=None):
-        """无 torch 时 @torch.no_grad() 只是透传"""
-        if fn is not None:
-            return fn
-        class _Ctx:
-            def __enter__(self): pass
-            def __exit__(self, *a): pass
-        return _Ctx()
-    torch.no_grad = _dummy_no_grad
-    F = types.ModuleType('torch.nn.functional')
-    _device = 'cpu'
-    _torch_available_final = False
-    _gpu_type = 'cpu'
-else:
-    _gpu_type = 'cpu'
-    _torch_available_final = False
-    # 1) 优先检测 NVIDIA CUDA
-    if torch.cuda.is_available():
-        _gpu_type = 'cuda'
-        _torch_available_final = True
-    # 2) 其次检测 Intel GPU (XPU) — 需要安装 intel-extension-for-pytorch
-    else:
-        try:
-            import intel_extension_for_pytorch as ipex  # noqa: F811
-            if hasattr(torch, 'xpu') and torch.xpu.is_available():
-                _gpu_type = 'xpu'
-                _torch_available_final = True
-        except ImportError:
-            pass
-    # 3) 后续可扩展 AMD ROCm (需 torch 编译时开启 ROCm 支持)
-    #    if hasattr(torch, 'cuda') and torch.cuda.is_available():  # ROCm 在 PyTorch 中也走 cuda 接口
+"""五子棋游戏 — PyQt5 界面层。
 
-    if _gpu_type == 'cuda':
-        _device = torch.device('cuda')
-    elif _gpu_type == 'xpu':
-        _device = torch.device('xpu')
-    else:
-        _device = torch.device('cpu')
+界面、交互、动画与日志展示在这里；AI 引擎在 engine.py（纯 CPU、零 Qt/torch），
+日志格式在 gamelog.py。本文件不再包含任何搜索或评估逻辑。
+"""
+import os
+import sys
+import math
+import threading
+
+import numpy as np
+
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QPushButton, QLabel,
-    QVBoxLayout, QHBoxLayout, QGridLayout, QStackedWidget,
-    QProgressBar, QFrame, QGraphicsDropShadowEffect, QSizePolicy
+    QApplication, QMainWindow, QWidget,
+    QVBoxLayout, QHBoxLayout, QStackedWidget, QStackedLayout,
+    QProgressBar, QFrame, QSizePolicy
 )
 from PyQt5.QtCore import (
-    Qt, QTimer, QThread, pyqtSignal, QPropertyAnimation,
-    QEasingCurve, QRect, QPoint, pyqtProperty
+    Qt, QTimer, QThread, pyqtSignal, QRect, QPoint, QPointF,
+    QElapsedTimer, QEasingCurve, QVariantAnimation
 )
 from PyQt5.QtGui import (
-    QPainter, QPen, QBrush, QColor, QFont, QFontDatabase,
-    QLinearGradient, QRadialGradient, QPixmap, QPainterPath,
-    QMouseEvent, QFontMetrics
+    QPainter, QPen, QBrush, QColor, QMouseEvent
 )
 
-# ==================== PyTorch 设备 ====================
-_device = None  # 由 try/except 设置
-_torch_available_final = False
-_gpu_type = 'cpu'  # 'cuda' | 'xpu' | 'cpu'
-
-
-def _ensure_torch():
-    """检查 PyTorch/GPU 是否真正可用（torch 已导入，此处仅返回状态）"""
-    return _torch_available_final
-
-
-def get_gpu_type():
-    """返回当前 GPU 类型：'cuda', 'xpu', 或 'cpu'"""
-    return _gpu_type
-
-
-# ==================== 游戏日志系统 ====================
-class GameLogger:
-    """
-    单局游戏日志记录器 — 将每步操作写入 txt 文件便于诊断AI决策。
-    
-    记录内容：
-      - 每步落子：步数、执棋方、坐标(如H8)、决策原因、评分/搜索深度
-      - 威胁检测命中详情
-      - AI搜索参数(target_depth, 实际搜到层数, best_val)
-      - 最终胜负结果
-    
-    用法：
-      logger = GameLogger()           # 创建（自动生成带时间戳的文件名）
-      logger.log_human(step, r, c)    # 记录人类落子
-      logger.log_ai(step, r, c, info) # 记录AI落子+决策元信息
-      logger.log_result(winner)       # 记录结果
-      logger.close()                  # 关闭文件
-    """
-
-    def __init__(self, log_dir=None):
-        import os
-        if log_dir is None:
-            log_dir = os.path.dirname(os.path.abspath(__file__))
-        os.makedirs(log_dir, exist_ok=True)
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        self.filepath = os.path.join(log_dir, f"game_log_{ts}.txt")
-        self.f = open(self.filepath, 'w', encoding='utf-8')
-        self._write_header()
-
-    def _write_header(self):
-        self.f.write("=" * 70 + "\n")
-        self.f.write("  五子棋AI 对局日志\n")
-        self.f.write(f"  生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        self.f.write(f"  日志文件: {self.filepath}\n")
-        self.f.write("=" * 70 + "\n\n")
-        self.f.write(f"{'步骤':>4} | {'执棋':>4} | {'坐标':>5} | {'决策原因':>20} | {'评分/信息':>25}\n")
-        self.f.write("-" * 75 + "\n")
-        self.f.flush()
-
-    @staticmethod
-    def coord_to_sgf(r, c):
-        """行列号转棋谱坐标 (如 row=7,col=7 -> H8)"""
-        col_letter = chr(ord('A') + c + (1 if c >= 8 else 0))  # 跳过I
-        return f"{col_letter}{r + 1}"
-
-    def log_move(self, step, player, r, c, reason="", detail=""):
-        player_name = "黑*" if player == 1 else "白O"
-        coord = self.coord_to_sgf(r, c)
-        self.f.write(
-            f"{step:>4} | {player_name:>4} | {coord:>5} | {reason:>20} | {detail}\n"
-        )
-        self.f.flush()
-
-    def log_human(self, step, player, r, c, detail=""):
-        self.log_move(step, player, r, c, "人类手动", detail)
-
-    def log_ai(self, step, player, r, c, decision_info):
-        """
-        AI落子 - decision_info 是字典:
-          'reason'/'depth'/'actual_depth'/'best_val'/'time_ms'/'threat_detail'/'top_moves'
-        """
-        reason = decision_info.get('reason', '未知')
-        dp = []
-        if 'best_val' in decision_info:
-            dp.append(f"val={decision_info['best_val']:.0f}")
-        if 'actual_depth' in decision_info:
-            dp.append(f"dep={decision_info['actual_depth']}")
-        if 'time_ms' in decision_info:
-            dp.append(f"{decision_info['time_ms']:.0f}ms")
-        if 'threat_detail' in decision_info:
-            dp.append(f"[{decision_info['threat_detail']}]")
-        detail = ", ".join(dp) if dp else ""
-        self.log_move(step, player, r, c, reason, detail)
-
-        if 'top_moves' in decision_info:
-            self.f.write(f"     候选走法: {decision_info['top_moves']}\n")
-            self.f.flush()
-
-    def log_threat_analysis(self, step, text):
-        self.f.write(f"     [威胁分析@{step}] {text}\n")
-        self.f.flush()
-
-    def log_board_state(self, step, board, note=""):
-        self.f.write(f"\n  --- 棋盘状态 @{step} {note} ---\n")
-        stones = []
-        for r in range(BOARD_SIZE):
-            for c in range(BOARD_SIZE):
-                if board[r][c] != 0:
-                    p = "*" if board[r][c] == 1 else "O"
-                    stones.append(f"{p}{self.coord_to_sgf(r,c)}")
-        self.f.write(f"  棋子({len(stones)}): {' '.join(stones)}\n\n")
-        self.f.flush()
-
-    def log_result(self, winner, total_steps, move_count):
-        self.f.write("\n" + "-" * 75 + "\n")
-        if winner == "ai":
-            result = "[AI 获胜]"
-        elif winner == "human":
-            result = "[人类获胜]"
-        else:
-            result = "[平局]"
-        self.f.write(f"  结果: {result}  |  总回合: {total_steps}  |  总落子: {move_count}\n")
-        self.f.write("=" * 70 + "\n")
-
-    def close(self):
-        if hasattr(self, 'f') and self.f and not self.f.closed:
-            try:
-                self.f.close()
-            except Exception:
-                pass
-
-
-# ==================== PyTorch 模式检测卷积核 ====================
-# 4个方向 (水平, 垂直, 对角线, 反对角线) 的模式内核
-# 用于 GPU 批量检测棋盘上的棋型
-_pattern_kernels_cached = None
-
-def _get_pattern_kernels():
-    """创建/获取模式检测卷积核（延迟创建 + 延迟导入torch）。
-    只在有GPU时才创建GPU张量，否则返回None表示不可用。"""
-    global _pattern_kernels_cached
-    if _pattern_kernels_cached is not None:
-        return _pattern_kernels_cached
-    
-    # 无GPU时直接返回空
-    if not _ensure_torch():
-        _pattern_kernels_cached = {}  # 标记为已尝试但不可用
-        return _pattern_kernels_cached
-
-    def _make_hk(size):  # 1xN 水平核
-        return torch.tensor([[[[1.0] * size]]], dtype=torch.float32)
-
-    # === 水平方向 1xN 核 (N=3~7) + 变体 ===
-    k_h7 = _make_hk(7); k_h6 = _make_hk(6); k_h5 = _make_hk(5)
-    k_h4 = _make_hk(4); k_h3 = _make_hk(3); k_h2 = _make_hk(2)
-
-    # 间隔跳活核
-    k_gap1 = torch.tensor([[[[1, 0, 1, 1, 1]]]], dtype=torch.float32)
-    k_gap2 = torch.tensor([[[[1, 1, 0, 1, 1]]]], dtype=torch.float32)
-    k_gap3 = torch.tensor([[[[1, 1, 1, 0, 1]]]], dtype=torch.float32)
-
-    # 反向变体
-    k_h4r = torch.tensor([[[[1, 1, 1, 1, 0]]]], dtype=torch.float32)
-    k_h3r = torch.tensor([[[[1, 1, 1, 0, 0]]]], dtype=torch.float32)
-    k_h2r = torch.tensor([[[[1, 1, 0, 0, 0]]]], dtype=torch.float32)
-
-    # === 垂直方向 (permute all horizontal) ===
-    def _v(k): return k.permute(0, 1, 3, 2)
-    k_v7, k_v6, k_v5 = _v(k_h7), _v(k_h6), _v(k_h5)
-    k_v4, k_v3, k_v2 = _v(k_h4), _v(k_h3), _v(k_h2)
-    k_v4r, k_v3r, k_v2r = _v(k_h4r), _v(k_h3r), _v(k_h2r)
-
-    # === 对角线/反对角线 5x5, 7x7 ===
-    def _diag(size):
-        k = torch.zeros(1, 1, size, size, dtype=torch.float32)
-        for i in range(size): k[0, 0, i, i] = 1
-        return k
-    def _adiag(size):
-        k = torch.zeros(1, 1, size, size, dtype=torch.float32)
-        for i in range(size): k[0, 0, i, size - 1 - i] = 1
-        return k
-
-    k_d7, k_d6, k_d5, k_d4, k_d3 = _diag(7), _diag(6), _diag(5), _diag(4), _diag(3)
-    k_ad7, k_ad6, k_ad5, k_ad4, k_ad3 = _adiag(7), _adiag(6), _adiag(5), _adiag(4), _adiag(3)
-
-    _pattern_kernels_cached = {
-        # 标准线型核 (H/V)
-        'h7': k_h7.to(_device), 'h6': k_h6.to(_device), 'h5': k_h5.to(_device),
-        'h4': k_h4.to(_device), 'h4r': k_h4r.to(_device),
-        'h3': k_h3.to(_device), 'h3r': k_h3r.to(_device),
-        'h2': k_h2.to(_device), 'h2r': k_h2r.to(_device),
-        'v7': k_v7.to(_device), 'v6': k_v6.to(_device), 'v5': k_v5.to(_device),
-        'v4': k_v4.to(_device), 'v4r': k_v4r.to(_device),
-        'v3': k_v3.to(_device), 'v3r': k_v3r.to(_device),
-        'v2': k_v2.to(_device), 'v2r': k_v2r.to(_device),
-        # 间隔跳活核 (H)
-        'h_gap1': k_gap1.to(_device), 'h_gap2': k_gap2.to(_device),
-        'h_gap3': k_gap3.to(_device),
-        # 对角线核 (D/AD)
-        'd7': k_d7.to(_device), 'd6': k_d6.to(_device), 'd5': k_d5.to(_device),
-        'd4': k_d4.to(_device), 'd3': k_d3.to(_device),
-        'ad7': k_ad7.to(_device), 'ad6': k_ad6.to(_device), 'ad5': k_ad5.to(_device),
-        'ad4': k_ad4.to(_device), 'ad3': k_ad3.to(_device),
-    }
-    return _pattern_kernels_cached
-
-# ==================== 常量 ====================
-BOARD_SIZE = 19
-CELL_SIZE = 34
-MARGIN = 40
-BOARD_PX = BOARD_SIZE * CELL_SIZE
-WINDOW_W = BOARD_PX + MARGIN * 2 + 280  # 右侧面板
-WINDOW_H = BOARD_PX + MARGIN * 2
-
-# 颜色方案
-COLOR_BG = QColor("#2c1810")
-COLOR_BOARD = QColor("#dcb35c")
-COLOR_LINE = QColor("#5a3a1a")
-COLOR_BLACK = QColor("#1a1a1a")
-COLOR_WHITE = QColor("#f0f0f0")
-COLOR_HIGHLIGHT = QColor("#ff6b6b")
-COLOR_PANEL_BG = QColor("#1e1e2e")
-COLOR_ACCENT = QColor("#89b4fa")
-COLOR_GREEN = QColor("#a6e3a1")
-COLOR_RED = QColor("#f38ba8")
-COLOR_TEXT = QColor("#cdd6f4")
-COLOR_SUBTEXT = QColor("#a6adc8")
-
-# ==================== Zobrist 哈希 ====================
-_zobrist_table = np.random.randint(0, 2**63, size=(2, BOARD_SIZE, BOARD_SIZE), dtype=np.uint64)
-_zobrist_black_turn = np.random.randint(0, 2**63, dtype=np.uint64)
-
-
-def zobrist_hash(board):
-    """计算当前棋盘的 Zobrist 哈希值"""
-    h = np.uint64(0)
-    for i in range(BOARD_SIZE):
-        for j in range(BOARD_SIZE):
-            if board[i][j] == 1:
-                h ^= _zobrist_table[0][i][j]
-            elif board[i][j] == 2:
-                h ^= _zobrist_table[1][i][j]
-    return h
-
-
-# ==================== PyTorch 棋盘评估引擎 ====================
-def _board_to_torch(board, player):
-    """将 numpy 棋盘转为 PyTorch 张量 (1, 2, 19, 19)
-    channel 0 = player 棋子, channel 1 = 对手棋子"""
-    opp = 1 if player == 2 else 2
-    p_ch = (board == player).astype(np.float32)
-    o_ch = (board == opp).astype(np.float32)
-    t = np.stack([p_ch, o_ch], axis=0)[np.newaxis, ...]  # (1, 2, 19, 19)
-    return torch.from_numpy(t).to(_device)
-
-def _batch_to_torch(boards_p, boards_o):
-    """批量转换：boards_p/boards_o 为 (N, 19, 19) numpy 数组，返回 (N, 2, 19, 19) tensor"""
-    t = np.stack([boards_p, boards_o], axis=1)  # (N, 2, 19, 19)
-    return torch.from_numpy(t.astype(np.float32)).to(_device)
-
-def _eval_board_torch(board_tensor):
-    """
-    用 GPU 张量运算评估棋盘（方向核）。
-    board_tensor: (1, 2, 19, 19), channel0=player, channel1=opponent.
-    返回 (player_score, opponent_score) 标量。
-    无GPU时回退到CPU评估。
-    """
-    kernels = _get_pattern_kernels()
-    p_chan = board_tensor[:, 0:1, :, :]
-    o_chan = board_tensor[:, 1:2, :, :]
-
-    def _score_channel(ch):
-        score = 0.0
-        # === 水平/垂直线型核 (N=2~7) ===
-        for n, thresh in [(7, 6.9), (6, 5.9), (5, 4.9), (4, 3.9), (3, 2.9), (2, 1.9)]:
-            for prefix in ['h', 'v']:
-                k = kernels.get(f'{prefix}{n}')
-                if k is not None:
-                    cnt = (F.conv2d(ch, k).squeeze() >= thresh).float().sum().item()
-                    if n >= 5:
-                        score += cnt * 100000000
-                    elif n >= 4:
-                        score += cnt * 500000
-                    elif n >= 3:
-                        score += cnt * 10000
-                    else:
-                        score += cnt * 200
-
-        # === 反向变体 ===
-        for k_name, thresh in [('h4r', 3.9), ('h3r', 2.9), ('h2r', 1.9),
-                                ('v4r', 3.9), ('v3r', 2.9), ('v2r', 1.9)]:
-            k = kernels.get(k_name)
-            if k is not None:
-                cnt = (F.conv2d(ch, k).squeeze() >= thresh).float().sum().item()
-                score += cnt * 500000 if k.shape[-1] >= 4 else (cnt * 10000 if k.shape[-1] >= 3 else cnt * 200)
-
-        # === 间隔跳活核 ===
-        for gname, gw in [('h_gap1', 500000), ('h_gap2', 500000), ('h_gap3', 500000)]:
-            k = kernels.get(gname)
-            if k is not None:
-                cnt = (F.conv2d(ch, k).squeeze() >= (k.numel() - 0.2)).float().sum().item()
-                score += cnt * gw
-
-        # === 对角线核 (N=3~7) ===
-        for n in [7, 6, 5, 4, 3]:
-            for prefix in ['d', 'ad']:
-                k = kernels.get(f'{prefix}{n}')
-                if k is not None:
-                    cnt = (F.conv2d(ch, k).squeeze() >= (n - 0.1)).float().sum().item()
-                    if n >= 5:
-                        score += cnt * 100000000
-                    elif n >= 4:
-                        score += cnt * 500000
-                    else:
-                        score += cnt * 10000
-
-        return score
-
-    with torch.no_grad():
-        return _score_channel(p_chan), _score_channel(o_chan)
-
-
-def _batch_eval_moves(board, moves, player):
-    """GPU 批量评估所有候选落子（方向核 × 2色 × N候选），专注有效棋型。
-    无GPU时自动回退到CPU排序。""" 
-    # 无torch/GPU时立即回退到纯CPU排序
-    if not _ensure_torch() or _device.type not in ('cuda', 'xpu'):
-        result = [(_quick_eval_move(board, r, c, player), r, c) for r, c in moves]
-        result.sort(reverse=True)
-        return result
-    
-    opp = 1 if player == 2 else 2
-    n = len(moves)
-    if n == 0:
-        return []
-
-    with torch.no_grad():
-        base_p = (board == player).astype(np.float32)
-        base_o = (board == opp).astype(np.float32)
-        boards_p = np.tile(base_p, (n, 1, 1))
-        boards_o = np.tile(base_o, (n, 1, 1))
-        for i, (r, c) in enumerate(moves):
-            boards_p[i, r, c] = 1.0
-            boards_o[i, r, c] = 0.0
-
-        tensor = _batch_to_torch(boards_p, boards_o)
-        kernels = _get_pattern_kernels()
-        scores = torch.zeros(n, dtype=torch.float32, device=_device)
-
-        def _add_batch_conv(ch, k, weight):
-            conv = F.conv2d(ch, k)
-            max_val = conv.amax(dim=[1, 2, 3])
-            hits = (max_val >= k.numel() - 0.2).float()
-            scores.add_(hits * weight)
-
-        p_ch = tensor[:, 0:1, :, :]
-        o_ch = tensor[:, 1:2, :, :]
-
-        for ch, mult in [(p_ch, 1.0), (o_ch, 0.95)]:
-            # === 线型核 (H/V N=2~7) ===
-            for prefix in ['h', 'v']:
-                for n, w in [(7, 500000000), (6, 200000000), (5, 100000000),
-                             (4, 500000), (3, 10000), (2, 200)]:
-                    k = kernels.get(f'{prefix}{n}')
-                    if k is not None:
-                        _add_batch_conv(ch, k, w * mult)
-
-            # === 反向变体 ===
-            for kname, w in [('h4r', 500000), ('h3r', 10000), ('h2r', 200),
-                              ('v4r', 500000), ('v3r', 10000), ('v2r', 200)]:
-                k = kernels.get(kname)
-                if k is not None:
-                    _add_batch_conv(ch, k, w * mult)
-
-            # === 间隔跳活核 ===
-            for gname, gw in [('h_gap1', 500000), ('h_gap2', 500000), ('h_gap3', 500000)]:
-                k = kernels.get(gname)
-                if k is not None:
-                    _add_batch_conv(ch, k, gw * mult)
-
-            # === 对角线核 ===
-            for n, w in [(7, 500000000), (6, 200000000), (5, 100000000),
-                         (4, 500000), (3, 10000)]:
-                for prefix in ['d', 'ad']:
-                    k = kernels.get(f'{prefix}{n}')
-                    if k is not None:
-                        _add_batch_conv(ch, k, w * mult)
-
-        # 中心加分（torch向量化）
-        move_tensor = torch.tensor(moves, dtype=torch.float32, device=_device)
-        center_dist = (move_tensor[:, 0] - 9).abs() + (move_tensor[:, 1] - 9).abs()
-        scores.add_(torch.clamp(18 - center_dist, min=0) * 5)
-
-    # 结合 CPU 复合棋型评估
-    cpu_scores = scores.cpu().numpy()
-    result = []
-    for i in range(n):
-        r, c = moves[i]
-        quick_score = _quick_eval_move(board, r, c, player)
-        combined = float(cpu_scores[i]) + quick_score
-        result.append((combined, r, c))
-    result.sort(reverse=True)
-    return result
-
-
-def _analyze_line(board, r, c, dr, dc, player):
-    """分析一条线上某个位置的棋型，返回 (count, open_ends, has_jump)"""
-    count = 1
-    open_ends = 0
-    has_jump = False
-
-    # 正方向
-    pos = 1
-    while True:
-        nr, nc = r + dr * pos, c + dc * pos
-        if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE:
-            if board[nr][nc] == player:
-                count += 1
-                pos += 1
-            elif board[nr][nc] == 0:
-                open_ends += 1
-                # 检查跳活
-                nr2, nc2 = r + dr * (pos + 1), c + dc * (pos + 1)
-                if 0 <= nr2 < BOARD_SIZE and 0 <= nc2 < BOARD_SIZE and board[nr2][nc2] == player:
-                    has_jump = True
-                break
-            else:
-                break
-        else:
-            break
-
-    # 反方向
-    pos = 1
-    while True:
-        nr, nc = r - dr * pos, c - dc * pos
-        if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE:
-            if board[nr][nc] == player:
-                count += 1
-                pos += 1
-            elif board[nr][nc] == 0:
-                open_ends += 1
-                nr2, nc2 = r - dr * (pos + 1), c - dc * (pos + 1)
-                if 0 <= nr2 < BOARD_SIZE and 0 <= nc2 < BOARD_SIZE and board[nr2][nc2] == player:
-                    has_jump = True
-                break
-            else:
-                break
-        else:
-            break
-
-    return count, open_ends, has_jump
-
-
-def evaluate_board(board, ai_player):
-    """评估棋盘局面（静态），正值对AI有利。使用专业权重 + 组合检测。"""
-    human_player = 1 if ai_player == 2 else 2
-
-    # 快速检查五连
-    if _check_win_fast(board, ai_player):
-        return 100000000
-    if _check_win_fast(board, human_player):
-        return -100000000
-
-    # ★★★ D2修复: 删除盲目的活四50M返回 ★★★
-    # 原代码: if _find_live_four_moves(board, ai_player): return 50000000
-    # 问题: 这让PVS搜索中AI误以为"自己有活四=必胜"，无视对手的VCT反击
-    # 正确做法: 让复合评估(ai_score - human_score * coef)自然处理
-    # 活四在_SCORE_TABLE中已经是10M，远高于其他棋型，无需额外加权
-    # 如果确实必胜（活四+对手无同级威胁），搜索自然会发现
-
-    ai_score = _eval_player_composite(board, ai_player)
-    human_score = _eval_player_composite(board, human_player)
-    # ★ 修复：0.85 替代 0.95，减少AI对自身局面的过度悲观
-    # 配合进攻激励增强，让AI在均势时不再偏向纯防守
-    return ai_score - human_score * 0.85
-
-
-# ==================== 专业棋型权重表（Gomocup参考） ====================
-# 棋型权重表（与旧版Alpha-Beta Engine保持一致的量级）
-# 关键：活四必须 >> 冲四 >> 活三 >> 眠三，量级差距决定搜索正确性
-_SCORE_TABLE = {
-    # 连五 / 成五
-    (5, True, 0): 100000000,   # 成五
-    (4, True, True): 10000000,   # 活四(双头) = 10M ★ 与旧版一致
-    (4, True, False): 10000000,  # 活四 = 10M ★ 旧版同
-    (4, False, True): 100000,    # 冲四(双头) = 100K ★ 旧版同
-    (4, False, False): 10000,    # 冲四 = 10K ★ 旧版同
-    (3, True, True): 1000000,    # 双活三 = 1M ★ 必胜级
-    (3, True, False): 10000,     # 活三 = 10K ★ 旧版同
-    (3, False, True): 1000,      # 双眠三 = 1K ★ 旧版同
-    (3, False, False): 500,      # 眠三 = 500 ★ 旧版同
-    (2, True, True): 1000,       # 双活二
-    (2, True, False): 200,       # 活二 ★ 旧版同
-    (2, False, False): 50,       # 眠二 ★ 旧版同
-    (1, True, False): 10,        # 活一 ★ 旧版同
-    (1, False, False): 1,        # 眠一 ★ 旧版同
-}
-
-
-def _get_line_score(count, open_ends, has_jump):
-    """根据标准棋型返回单线分值（与旧版SCORE_MAP键格式一致）"""
-    cnt = min(count, 5)
-    is_live = (open_ends >= 2)  # 两端空 = 活
-    key = (cnt, is_live, has_jump)
-    if key in _SCORE_TABLE:
-        return _SCORE_TABLE[key]
-    # 回退：尝试非跳棋型
-    fallback = (cnt, is_live, False)
-    if fallback in _SCORE_TABLE:
-        return _SCORE_TABLE[fallback]
-    # 最终回退
-    if cnt >= 5:
-        return 100000000
-    return _SCORE_TABLE.get((cnt, False, False), 0)
-
-
-# ==================== 静态评估缓存 (eval_cache) ====================
-_eval_cache = {}
-
-def _cached_evaluate(board, ai_player):
-    """带 Zobrist 缓存的静态评估（避免重复全盘扫描）"""
-    h = zobrist_hash(board)
-    if h in _eval_cache:
-        return _eval_cache[h]
-    val = evaluate_board(board, ai_player)
-    if len(_eval_cache) > 1 << 18:  # 约26万条
-        _eval_cache.clear()
-    _eval_cache[h] = val
-    return val
-
-
-def _eval_player_composite(board, player):
-    """专业权重复合适配评估单方局面（每个方向独立评估，避免遗漏交叉威胁）"""
-    score = 0
-    directions = [(1, 0), (0, 1), (1, 1), (1, -1)]
-    # 使用 (r,c,dr,dc) 跟踪已评估的线段，避免同线重复但允许交叉方向
-    line_evaluated = set()
-    # 组合计数器
-    live4_cnt = rush4_cnt = dead4_cnt = 0
-    live3_cnt = sleep3_cnt = 0
-    jump_live3_cnt = 0
-    live2_cnt = 0
-
-    for r in range(BOARD_SIZE):
-        for c in range(BOARD_SIZE):
-            if board[r][c] != player:
-                continue
-            for dr, dc in directions:
-                # 同一线段、同一方向只评估一次
-                line_key = (r, c, dr, dc)
-                if line_key in line_evaluated:
-                    continue
-                count, open_ends, has_jump = _analyze_line(board, r, c, dr, dc, player)
-                if count >= 5:
-                    return 100000000
-                if count >= 1:
-                    # 标记整条线段上的所有位置（仅当前方向）
-                    for k in range(count):
-                        nr, nc = r + dr * k, c + dc * k
-                        if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE:
-                            line_evaluated.add((nr, nc, dr, dc))
-                    
-                    s = _get_line_score(count, open_ends, has_jump)
-                    center_dist = abs(r - 9) + abs(c - 9)
-                    center_bonus = max(0, 18 - center_dist) * 0.03
-                    score += int(s * (1 + center_bonus))
-
-                    # 统计组合
-                    if count >= 4 and open_ends >= 2:
-                        live4_cnt += 1
-                    elif count >= 4 and open_ends == 1:
-                        rush4_cnt += 1
-                    elif count >= 4 and open_ends == 0:
-                        dead4_cnt += 1
-                    elif count == 3 and open_ends >= 2 and not has_jump:
-                        live3_cnt += 1
-                    elif count == 3 and open_ends >= 2 and has_jump:
-                        jump_live3_cnt += 1
-                    elif count == 3 and open_ends == 1:
-                        sleep3_cnt += 1
-                    elif count == 2 and open_ends >= 2:
-                        live2_cnt += 1
-
-    # === 组合加成（对手无法同时防守）— 与新评分表量级一致 ===
-    # 双活三 → 必胜级（1M）
-    if live3_cnt + jump_live3_cnt >= 2:
-        score += 1000000  # 双活三必胜
-    # 冲四 + 活三 → 必胜级（5M）
-    if rush4_cnt >= 1 and (live3_cnt + jump_live3_cnt) >= 1:
-        score += 5000000
-    # 双冲四 → 高危
-    if rush4_cnt >= 2:
-        score += 5000000
-    # 双眠三
-    if sleep3_cnt >= 2:
-        score += 2000
-    # 活三 + 眠三
-    if (live3_cnt + jump_live3_cnt) >= 1 and sleep3_cnt >= 1:
-        score += 15000
-    # 冲四 + 活二
-    if rush4_cnt >= 1 and live2_cnt >= 1:
-        score += 50000
-
-    return score
-
-
-def _check_win_fast(board, player):
-    """快速检查是否有五连"""
-    # 横向
-    for r in range(BOARD_SIZE):
-        cnt = 0
-        for c in range(BOARD_SIZE):
-            cnt = cnt + 1 if board[r][c] == player else 0
-            if cnt >= 5:
-                return True
-    # 纵向
-    for c in range(BOARD_SIZE):
-        cnt = 0
-        for r in range(BOARD_SIZE):
-            cnt = cnt + 1 if board[r][c] == player else 0
-            if cnt >= 5:
-                return True
-    # 对角线 (方向: 右下)
-    for r in range(BOARD_SIZE - 4):
-        for c in range(BOARD_SIZE - 4):
-            if all(board[r + k][c + k] == player for k in range(5)):
-                return True
-    # 对角线 (方向: 左下)
-    for r in range(4, BOARD_SIZE):
-        for c in range(BOARD_SIZE - 4):
-            if all(board[r - k][c + k] == player for k in range(5)):
-                return True
-    return False
-
-
-def check_win(board, player):
-    """公开接口：检查玩家是否获胜"""
-    return _check_win_fast(board, player)
-
-
-# ==================== 杀手启发 & 历史启发 ====================
-MAX_DEPTH = 12
-_killer_moves = [[None, None] for _ in range(MAX_DEPTH)]  # 每层2个杀手走法
-
-# 历史启发表：history[player][r][c] 记录该落子导致beta截断的次数
-_history_table = np.zeros((2, BOARD_SIZE, BOARD_SIZE), dtype=np.int32)
-
-def _record_killer(depth, r, c):
-    """记录杀手走法（LRU风格：新杀手放第一位，旧的移到第二位）"""
-    if _killer_moves[depth][0] == (r, c):
-        return
-    _killer_moves[depth][1] = _killer_moves[depth][0]
-    _killer_moves[depth][0] = (r, c)
-
-def _record_history(player, r, c, depth):
-    """记录历史启发：用 depth^2 作为增量，越深截断越有价值"""
-    _history_table[player - 1][r][c] += depth * depth
-
-def _is_killer(depth, r, c):
-    """检查是否为杀手走法"""
-    k0, k1 = _killer_moves[depth]
-    return (r, c) == k0 or (r, c) == k1
-
-def _get_history(player, r, c):
-    """获取历史启发分数（用于排序）"""
-    return _history_table[player - 1][r][c]
-
-
-# ==================== 置换表 (Transposition Table) ====================
-TT_SIZE = 1 << 20  # 约100万条 (2^20)
-TT_MASK = TT_SIZE - 1
-# 固定数组：每个槽存储 (full_hash, depth, value, flag, best_move, age)
-# flag: 0=EXACT, 1=UPPERBOUND, 2=LOWERBOUND
-_transposition_table = [None] * TT_SIZE
-_tt_age = 0  # 全局年龄计数器，用于年龄优先淘汰
-
-
-def tt_store(hash_key, depth, value, flag, best_move):
-    """存入置换表（深度优先 + 年龄优先覆盖策略）"""
-    global _tt_age
-    idx = int(hash_key) & TT_MASK
-    entry = _transposition_table[idx]
-    if entry is None or depth >= entry[1] or _tt_age - entry[5] > 10000:
-        _transposition_table[idx] = (hash_key, depth, value, flag, best_move, _tt_age)
-
-
-def tt_lookup(hash_key, depth, alpha, beta):
-    """查询置换表 (直接数组索引，O(1))
-    flag: 0=EXACT, 1=UPPERBOUND, 2=LOWERBOUND
-    """
-    idx = int(hash_key) & TT_MASK
-    entry = _transposition_table[idx]
-    if entry is None:
-        return None, None, False
-    stored_hash, stored_depth, stored_value, flag, best_move, _ = entry
-    if stored_hash != hash_key:
-        return None, None, False  # 哈希冲突
-    if stored_depth >= depth:
-        if flag == 0:  # EXACT
-            return stored_value, best_move, True
-        elif flag == 1 and stored_value <= alpha:  # UPPERBOUND
-            return stored_value, best_move, True
-        elif flag == 2 and stored_value >= beta:   # LOWERBOUND
-            return stored_value, best_move, True
-    return None, best_move, False  # 深度不够，但仍返回建议走法
-
-
-def _generate_moves(board, around_only=True):
-    """生成候选落子位置，优先考虑已有棋子周围2格"""
-    if around_only:
-        moves = set()
-        for r in range(BOARD_SIZE):
-            for c in range(BOARD_SIZE):
-                if board[r][c] != 0:
-                    for dr in range(-2, 3):
-                        for dc in range(-2, 3):
-                            nr, nc = r + dr, c + dc
-                            if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE and board[nr][nc] == 0:
-                                moves.add((nr, nc))
-        if moves:
-            return list(moves)
-
-    moves = []
-    for r in range(BOARD_SIZE):
-        for c in range(BOARD_SIZE):
-            if board[r][c] == 0:
-                moves.append((r, c))
-    return moves
-
-
-def _composite_eval(board, r, c, player):
-    """
-    棋型组合评估（评分与_SCORE_TABLE/旧版保持一致量级）:
-    检测落子后在所有方向上的棋型组合。
-    修复：活四=10M级，冲四=100K级，活三=10K级
-    """
-    directions = [(1, 0), (0, 1), (1, 1), (1, -1)]
-    live4_cnt = rush4_cnt = dead4_cnt = 0
-    live3_cnt = jump_live3_cnt = sleep3_cnt = 0
-    live2_cnt = 0
-    win = False
-
-    for dr, dc in directions:
-        count, open_ends, has_jump = _analyze_line(board, r, c, dr, dc, player)
-        if count >= 5:
-            win = True
-            break
-        if count >= 4 and open_ends >= 2:
-            live4_cnt += 1
-        elif count >= 4 and open_ends == 1:
-            rush4_cnt += 1
-        elif count >= 4:
-            dead4_cnt += 1
-        elif count == 3 and open_ends >= 2 and not has_jump:
-            live3_cnt += 1
-        elif count == 3 and open_ends >= 2 and has_jump:
-            jump_live3_cnt += 1
-        elif count == 3 and open_ends == 1:
-            sleep3_cnt += 1
-        elif count == 2 and open_ends >= 2:
-            live2_cnt += 1
-
-    if win:
-        return 100000000
-
-    # === 权重评分（与新 _SCORE_TABLE 一致） ===
-    score = 0
-
-    # 活四: 10M（必胜级）
-    if live4_cnt >= 1:
-        score += 10000000
-    if live4_cnt >= 2:
-        score += 50000000  # 双活四
-
-    # 冲四: 10K~100K
-    if rush4_cnt >= 1:
-        score += 10000
-    if rush4_cnt >= 2:
-        score += 150000   # 双冲四
-
-    # 眠四: 10K
-    if dead4_cnt >= 1:
-        score += 10000
-
-    # 活三: 10K，跳活三: 同级
-    if live3_cnt >= 1:
-        score += 10000
-    if jump_live3_cnt >= 1:
-        score += 8000
-
-    # 双活三 (含跳活三): 1M（必胜级）
-    total_live3 = live3_cnt + jump_live3_cnt
-    if total_live3 >= 2:
-        score += 1000000
-
-    # 冲四 + 活三 组合: 必胜
-    if rush4_cnt >= 1 and total_live3 >= 1:
-        score += 5000000
-
-    # 眠三: 500
-    if sleep3_cnt >= 1:
-        score += 500
-    if sleep3_cnt >= 2:
-        score += 1000   # 双眠三
-
-    # 活二: 200
-    if live2_cnt >= 1:
-        score += 200
-    if live2_cnt >= 2:
-        score += 1000   # 双活二
-
-    # 冲四 + 活二
-    if rush4_cnt >= 1 and live2_cnt >= 1:
-        score += 50000
-
-    return score
-
-
-def _quick_eval_move(board, r, c, player):
-    """快速评估单个落子的价值（用于启发式排序），进攻权重 > 防守权重。
-    恢复旧版显式棋型评分逻辑，确保走法排序质量。"""
-    score = 0
-    directions = [(1, 0), (0, 1), (1, 1), (1, -1)]
-    opp = 1 if player == 2 else 2
-
-    # ===== 进攻评估（自己的棋型） =====
-    for dr, dc in directions:
-        count, open_ends, has_jump = _analyze_line(board, r, c, dr, dc, player)
-        if count >= 5:
-            return 100000000  # 直接五连，最高优先级
-        if count == 4 and open_ends >= 2:
-            score += 7000000   # 活四（必胜），与防守比=2.33x
-        elif count == 4 and open_ends == 1:
-            score += 700000    # 冲四，与防守比=2.33x
-        elif count == 3 and open_ends >= 2:
-            score += 80000     # 活三（下一步就活四），与防守比=2.67x
-        elif count == 3 and open_ends == 1:
-            score += 7000      # 眠三
-        elif count == 2 and open_ends >= 2:
-            score += 1500      # 活二
-        elif count == 2 and open_ends == 1:
-            score += 300       # 眠二
-        elif count == 1 and open_ends >= 2:
-            score += 50        # 活一
-
-    # ===== 防守评估（堵对手的棋型） =====
-    # 关键修复：防守分数不能超过同级别的进攻分数
-    for dr, dc in directions:
-        count, open_ends, has_jump = _analyze_line(board, r, c, dr, dc, opp)
-        if count >= 5:
-            score += 90000000   # 堵对手五连（仅次于自己五连）
-        elif count == 4 and open_ends >= 2:
-            score += 3000000    # 堵对手活四
-        elif count == 4 and open_ends == 1:
-            score += 300000     # 堵对手冲四
-        elif count == 3 and open_ends >= 2:
-            score += 30000      # 堵对手活三（低于自己活三的50000）
-        elif count == 3 and open_ends == 1:
-            score += 3000       # 堵对手眠三
-        elif count == 2 and open_ends >= 2:
-            score += 500        # 堵对手活二
-
-    # 中心位置加分
-    center_dist = abs(r - 9) + abs(c - 9)
-    score += max(0, 18 - center_dist) * 5
-
-    return score
-
-
-def _order_moves(move_list, board, current_player, depth, hash_key=None, tt_best_move=None):
-    """
-    综合排序候选落子：TT最佳 → 杀手 → 历史 → 复合棋型评估。
-    PVS 对排序质量要求极高，好的排序让零窗口搜索大概率成功。
-    """
-    scored = []
-    for r, c in move_list:
-        # 1. TT 首选
-        if tt_best_move and (r, c) == tt_best_move:
-            priority = 10000000000
-        # 2. 杀手走法最高优先
-        elif _is_killer(depth, r, c):
-            priority = 5000000000
-        else:
-            # 3. 历史启发 + 复合棋型评估
-            hist = _get_history(current_player, r, c)
-            eval_score = _quick_eval_move(board, r, c, current_player)
-            priority = hist + eval_score
-        scored.append((priority, r, c))
-    scored.sort(reverse=True)
-    return scored
-
-
-def alpha_beta(board, depth, alpha, beta, maximizing, ai_player, hash_key=None, ply=0):
-    """
-    PVS + 置换表 + LMR + 杀手/历史启发 + GPU 批量评估。
-
-    核心改进：
-    - PVS 零窗口搜索（第一个分支全窗口，后续零窗口）
-    - LMR (Late Move Reduction)：靠后的走法减少搜索深度
-      前3个不走法不减，4~8减1，9+减2（历史分高可豁免）
-    - 置换表 O(1) 查询/存储
-    - 深度 <= 3 时 GPU 批量排序
-    """
-    global _tt_age
-    _tt_age += 1
-    human_player = 1 if ai_player == 2 else 2
-
-    # === 置换表查询 ===
-    if hash_key is None:
-        hash_key = zobrist_hash(board)
-    cached_val, cached_move, hit = tt_lookup(hash_key, depth, alpha, beta)
-    if hit and depth > 0:
-        return cached_val
-
-    # 终局判断
-    if _check_win_fast(board, ai_player):
-        return 10000000 + depth
-    if _check_win_fast(board, human_player):
-        return -10000000 - depth
-    if depth == 0:
-        return _cached_evaluate(board, ai_player)
-
-    all_moves = _generate_moves(board)
-    if not all_moves:
-        return 0
-
-    current_player = ai_player if maximizing else human_player
-
-    # === 深层节点使用 GPU 批量评估加速（仅当GPU真正可用时） ===
-    use_gpu_batch = (_ensure_torch() and _device.type in ('cuda', 'xpu')
-                     and depth <= 3 and len(all_moves) >= 10)
-
-    if use_gpu_batch:
-        gpu_scores = _batch_eval_moves(board, all_moves, current_player)
-        max_branch = 15   # GPU分支因子也收紧
-        if len(gpu_scores) > max_branch:
-            gpu_scores = gpu_scores[:max_branch]
-        move_scores = gpu_scores
-    else:
-        move_scores = _order_moves(all_moves, board, current_player, depth, hash_key, cached_move)
-        max_branch = 20 if depth <= 1 else 15   # 修复：与旧版一致
-        if len(move_scores) > max_branch:
-            move_scores = move_scores[:max_branch]
-
-    # === LMR 参数（修复：对浅层搜索更保守） ===
-    # 五子棋搜索深度较浅，LMR 过激会导致大部分走法几乎不搜
-    LMR_FULL_DEPTH_MOVES = 5   # 前5个走法不减深度（增加从3→5）
-    LMR_REDUCTION_1 = 1        # 后续走法最多减1层（移除减2层）
-    LMR_THRESHOLD_1 = 999      # 不再区分更多减幅（统一只减1）
-    LMR_MIN_DEPTH = 5          # 深度 >= 5 才启用LMR（从3→5，浅层不做LMR）
-
-    best_move = None
-    first_child = True
-    move_index = 0
-
-    if maximizing:
-        best_val = float('-inf')
-        for _, r, c in move_scores:
-            board[r][c] = ai_player
-            new_hash = hash_key ^ _zobrist_table[ai_player - 1][r][c]
-
-            # === LMR: Late Move Reduction（修复：统一只减1层） ===
-            if not first_child and depth >= LMR_MIN_DEPTH and move_index >= LMR_FULL_DEPTH_MOVES:
-                # 统一减1层（不再区分更多减幅）
-                reduction = LMR_REDUCTION_1
-                # 历史分数高的走法减幅豁免（好棋值得深搜）
-                hist = _get_history(ai_player, r, c)
-                if hist > 50 * depth:
-                    reduction = 0
-                reduced_depth = max(1, depth - 1 - reduction)
-
-                # 零窗口 + 降深度搜索
-                val = alpha_beta(board, reduced_depth, alpha, alpha + 1, False, ai_player, new_hash, ply + 1)
-                if val > alpha:
-                    # 降深度搜索发现好棋 → 全深度重搜
-                    val = alpha_beta(board, depth - 1, alpha, beta, False, ai_player, new_hash, ply + 1)
-            elif first_child:
-                # 第一个分支：全窗口搜索
-                val = alpha_beta(board, depth - 1, alpha, beta, False, ai_player, new_hash, ply + 1)
-                first_child = False
-            else:
-                # PVS 零窗口
-                val = alpha_beta(board, depth - 1, alpha, alpha + 1, False, ai_player, new_hash, ply + 1)
-                if alpha < val < beta:
-                    val = alpha_beta(board, depth - 1, val, beta, False, ai_player, new_hash, ply + 1)
-
-            board[r][c] = 0
-
-            if val > best_val:
-                best_val = val
-                best_move = (r, c)
-            alpha = max(alpha, val)
-            move_index += 1
-            if beta <= alpha:
-                _record_killer(depth, r, c)
-                _record_history(ai_player, r, c, depth)
-                break
-        flag = 2 if best_val >= beta else (0 if best_val > float('-inf') else 1)
-    else:
-        best_val = float('inf')
-        for _, r, c in move_scores:
-            board[r][c] = human_player
-            new_hash = hash_key ^ _zobrist_table[human_player - 1][r][c]
-
-            # === LMR: Late Move Reduction (minimizing side) ===
-            if not first_child and depth >= LMR_MIN_DEPTH and move_index >= LMR_FULL_DEPTH_MOVES:
-                reduction = LMR_REDUCTION_1
-                hist = _get_history(human_player, r, c)
-                if hist > 50 * depth:
-                    reduction = 0
-                reduced_depth = max(1, depth - 1 - reduction)
-
-                val = alpha_beta(board, reduced_depth, beta - 1, beta, True, ai_player, new_hash, ply + 1)
-                if val < beta:
-                    val = alpha_beta(board, depth - 1, alpha, beta, True, ai_player, new_hash, ply + 1)
-            elif first_child:
-                val = alpha_beta(board, depth - 1, alpha, beta, True, ai_player, new_hash, ply + 1)
-                first_child = False
-            else:
-                val = alpha_beta(board, depth - 1, beta - 1, beta, True, ai_player, new_hash, ply + 1)
-                if beta - 1 < val < beta:
-                    val = alpha_beta(board, depth - 1, alpha, val, True, ai_player, new_hash, ply + 1)
-
-            board[r][c] = 0
-
-            if val < best_val:
-                best_val = val
-                best_move = (r, c)
-            beta = min(beta, val)
-            move_index += 1
-            if beta <= alpha:
-                _record_killer(depth, r, c)
-                _record_history(human_player, r, c, depth)
-                break
-        flag = 1 if best_val <= alpha else (0 if best_val < float('inf') else 2)
-
-    # 存入置换表
-    if best_move:
-        tt_store(hash_key, depth, best_val, flag, best_move)
-
-    return best_val
-
-
-def _count_line(board, r, c, dr, dc, player):
-    """计算(r,c)位置在(dr,dc)方向上player的连续棋子数（不含落子本身）"""
-    cnt = 0
-    for k in range(1, 5):
-        nr, nc = r + dr * k, c + dc * k
-        if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE and board[nr][nc] == player:
-            cnt += 1
-        else:
-            break
-    for k in range(1, 5):
-        nr, nc = r - dr * k, c - dc * k
-        if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE and board[nr][nc] == player:
-            cnt += 1
-        else:
-            break
-    return cnt
-
-
-def _find_winning_moves(board, player):
-    """查找所有能让player直接五连获胜的位置"""
-    winning = []
-    moves = _generate_moves(board)
-    for r, c in moves:
-        board[r][c] = player
-        if _check_win_fast(board, player):
-            winning.append((r, c))
-        board[r][c] = 0
-    return winning
-
-
-def _analyze_live_four(board, r, c, dr, dc, player):
-    """
-    精确检查在(r,c)落子后，沿(dr,dc)方向是否形成真正的活四。
-    
-    活四定义：在一条直线上恰好有4连子，且两端紧邻位置均为空位，
-    这样对手无论堵哪一端，下一步都能形成五连。
-    
-    返回 True/False。
-    """
-    opp = 1 if player == 2 else 2
-    
-    # Step 1: 从落子位置向正方向扫描，找到连续player棋子最远端
-    pos_max = 0
-    for k in range(1, 6):
-        nr, nc = r + dr * k, c + dc * k
-        if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE and board[nr][nc] == player:
-            pos_max = k
-        else:
-            break
-    
-    # Step 2: 从落子位置向反方向扫描，找到连续player棋子最远端
-    neg_max = 0
-    for k in range(1, 6):
-        nr, nc = r - dr * k, c - dc * k
-        if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE and board[nr][nc] == player:
-            neg_max = k
-        else:
-            break
-    
-    # 总连续棋子数 = 正方向 + 反方向 + 落子自身
-    total = pos_max + neg_max + 1
-    
-    # 必须恰好4连（或更多，但活四特指4连）
-    if total < 4:
-        return False
-    if total > 4:
-        # 5连及以上已经是赢了，由 _check_win_fast 处理
-        # 这里只关心真正的活四
-        return False
-    
-    # Step 3: 检查两端紧邻位置是否都是空位
-    # 正方向端点：从最远的连续棋子再往外一格
-    nr_pos = r + dr * (pos_max + 1)
-    nc_pos = c + dc * (pos_max + 1)
-    pos_empty = (0 <= nr_pos < BOARD_SIZE and 0 <= nc_pos < BOARD_SIZE and board[nr_pos][nc_pos] == 0)
-    
-    # 反方向端点：从最远的连续棋子再往外一格
-    nr_neg = r - dr * (neg_max + 1)
-    nc_neg = c - dc * (neg_max + 1)
-    neg_empty = (0 <= nr_neg < BOARD_SIZE and 0 <= nc_neg < BOARD_SIZE and board[nr_neg][nc_neg] == 0)
-    
-    return pos_empty and neg_empty
-
-
-def _has_live_four_after_move(board, r, c, player):
-    """
-    检查在(r,c)落子后，player是否形成活四。
-    在4个方向上分别检查。
-    """
-    board[r][c] = player
-    directions = [(1, 0), (0, 1), (1, 1), (1, -1)]
-    result = any(_analyze_live_four(board, r, c, dr, dc, player) for dr, dc in directions)
-    board[r][c] = 0
-    return result
-
-
-def _find_live_four_moves(board, player):
-    """查找所有能形成活四的位置"""
-    live4_moves = []
-    moves = _generate_moves(board)
-    for r, c in moves:
-        if _has_live_four_after_move(board, r, c, player):
-            live4_moves.append((r, c))
-    return live4_moves
-
-
-def _get_pattern_types(board, r, c, player):
-    """
-    获取在(r,c)落子后，player在四个方向上形成的棋型类型。
-    返回包含: has_live4, has_rush4, has_live3, has_sleep3
-    """
-    directions = [(1, 0), (0, 1), (1, 1), (1, -1)]
-    board[r][c] = player
-    has_live4 = False
-    has_rush4 = False
-    has_live3 = False
-    has_sleep3 = False
-
-    for dr, dc in directions:
-        count, open_ends, _ = _analyze_line(board, r, c, dr, dc, player)
-        if count >= 5:
-            board[r][c] = 0
-            return True, True, True, True  # 五连
-        if count == 4 and open_ends >= 2:
-            has_live4 = True
-        elif count == 4 and open_ends == 1:
-            has_rush4 = True
-        elif count == 3 and open_ends >= 2:
-            has_live3 = True
-        elif count == 3 and open_ends == 1:
-            has_sleep3 = True
-
-    board[r][c] = 0
-    return has_live4, has_rush4, has_live3, has_sleep3
-
-
-def _find_forced_win(board, player, max_depth=6):
-    """
-    增强 Threat-Space Search: 搜索进攻 + 防守强制获胜序列（VCF/VCT）。
-    
-    改进：
-    - 深度提升到 6（可配合时间控制到 8）
-    - 启发式剪枝：只搜索产生新威胁的走法（冲四/活四/活三）
-    - 防守 TSS：对手有威胁时搜索防守路线
-    """
-    import time as _tss_time
-
-    opp = 1 if player == 2 else 2
-    _tss_start = _tss_time.time()
-    _tss_limit = 2.0  # TSS 上限 2 秒
-    _tss_visited = set()
-    _tss_node_count = [0]
-    _TSS_MAX_NODES = 500000
-
-    def _has_new_threat(board, r, c, p):
-        """检查(r,c)落子后是否产生新威胁（冲四/活四/活三）"""
-        board[r][c] = p
-        has_live4, has_rush4, has_live3, _ = _get_pattern_types(board, r, c, p)
-        board[r][c] = 0
-        return has_live4 or has_rush4 or has_live3
-
-    def _tss_endpoints(board, r, c, p):
-        """找到(r,c)处p棋子形成的4+连子的所有空位端点（对手必堵位置）"""
-        ends = set()
-        for dr, dc in [(1, 0), (0, 1), (1, 1), (1, -1)]:
-            pos_cnt = 1
-            for k in range(1, 6):
-                nr, nc = r + dr * k, c + dc * k
-                if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE and board[nr][nc] == p:
-                    pos_cnt += 1
-                else:
-                    break
-            neg_cnt = 1
-            for k in range(1, 6):
-                nr, nc = r - dr * k, c - dc * k
-                if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE and board[nr][nc] == p:
-                    neg_cnt += 1
-                else:
-                    break
-            total = pos_cnt + neg_cnt - 1
-            if total >= 4:
-                nr1, nc1 = r + dr * pos_cnt, c + dc * pos_cnt
-                if 0 <= nr1 < BOARD_SIZE and 0 <= nc1 < BOARD_SIZE and board[nr1][nc1] == 0:
-                    ends.add((nr1, nc1))
-                nr2, nc2 = r - dr * neg_cnt, c - dc * neg_cnt
-                if 0 <= nr2 < BOARD_SIZE and 0 <= nc2 < BOARD_SIZE and board[nr2][nc2] == 0:
-                    ends.add((nr2, nc2))
-        return ends
-
-    def _tt(board_tuple, player, depth):
-        nonlocal _tss_start, _tss_limit, _tss_visited, _tss_node_count
-
-        if depth == 0:
-            return None
-        _tss_node_count[0] += 1
-        if _tss_node_count[0] > _TSS_MAX_NODES:
-            return None
-        if _tss_time.time() - _tss_start > _tss_limit:
-            return None
-
-        key = (board_tuple, player, depth)
-        if key in _tss_visited:
-            return None
-        _tss_visited.add(key)
-
-        board = np.array(board_tuple, dtype=int).reshape(BOARD_SIZE, BOARD_SIZE)
-        moves = _generate_moves(board)
-
-        # 启发式：只搜索威胁走法
-        threat_moves = []
-        for r, c in moves:
-            if _has_new_threat(board, r, c, player):
-                threat_moves.append((r, c))
-
-        if not threat_moves:
-            return None
-
-        # 排序：优先尝试能直接五连的走法
-        threat_moves.sort(key=lambda m: _quick_eval_move(board, m[0], m[1], player), reverse=True)
-
-        for r, c in threat_moves:
-            if _tss_time.time() - _tss_start > _tss_limit:
-                return None
-
-            board[r][c] = player
-            if _check_win_fast(board, player):
-                board[r][c] = 0
-                return [(r, c)]
-
-            defense_moves = _tss_endpoints(board, r, c, player)
-            if not defense_moves:
-                board[r][c] = 0
-                continue
-
-            for def_r, def_c in defense_moves:
-                if board[def_r][def_c] != 0:
-                    continue
-                board[def_r][def_c] = opp
-                new_tuple = tuple(board.flatten())
-                result = _tt(new_tuple, player, depth - 1)
-                board[def_r][def_c] = 0
-                if result is not None:
-                    board[r][c] = 0
-                    return [(r, c)] + result
-
-            board[r][c] = 0
-        return None
-
-    board_tuple = tuple(board.flatten())
-    return _tt(board_tuple, player, max_depth)
-
-
-def _check_immediate_threat(board, player):
-    """
-    紧急威胁检测（修复S1: 与旧版对齐，只处理真正imminent的威胁）：
-    
-    旧版只有4项检测，新版之前有7项(含深层TSS)，TSS抢先触发导致AI走低效的长路径。
-    
-    现在的策略：
-    1. 自己能五连 → 直接赢（总是正确）
-    2. 对手能五连 → 必须堵（总是正确）
-    3. 自己能形成活四（必胜局面，2步内赢）→ 走这里
-    4. 对手能形成活四 → 必须堵（必须防守）
-    
-    注意：TSS/VCF/双活三等深层策略交给主搜索(alpha_beta)处理，
-         不在威胁检测阶段抢先返回，避免走低效长路径。
-    """
-    opp = 1 if player == 2 else 2
-
-    # 1. 自己能否直接五连
-    my_win = _find_winning_moves(board, player)
-    if my_win:
-        return my_win[0]
-
-    # 2. 对手能否直接五连（必须堵）
-    opp_win = _find_winning_moves(board, opp)
-    if opp_win:
-        return opp_win[0]
-
-    # 3. 自己能否形成活四（必胜局面，下一步成五）
-    my_live4 = _find_live_four_moves(board, player)
-    if my_live4:
-        return my_live4[0]
-
-    # 4. 对手能否形成活四（必须提前堵，否则对手下一步成五）
-    opp_live4 = _find_live_four_moves(board, opp)
-    if opp_live4:
-        return opp_live4[0]
-
-    # ★★ 修复速亡：检测2-3步内的必胜/必败棋型 ★★
-    # 这些不是深层TSS（不会返回长路径），而是真正的近端威胁
-    moves = _generate_moves(board)
-
-    # 5. 自己能否形成双活三或冲四+活三（2步内必胜）→ 进攻
-    for r, c in moves:
-        board[r][c] = player
-        live3_dirs = []
-        rush4_dirs = []
-        for dr, dc in [(1, 0), (0, 1), (1, 1), (1, -1)]:
-            count, open_ends, _ = _analyze_line(board, r, c, dr, dc, player)
-            if count == 3 and open_ends >= 2:
-                live3_dirs.append((dr, dc))
-            elif count >= 4:
-                rush4_dirs.append((dr, dc))
-        board[r][c] = 0
-
-        # 双活三 / 双冲四 = 绝对必胜，直接走
-        if len(live3_dirs) >= 2 or len(rush4_dirs) >= 2:
-            return (r, c)
-        # 冲四+活三 = 也几乎必胜
-        if len(rush4_dirs) >= 1 and len(live3_dirs) >= 1:
-            return (r, c)
-
-    # 6. 对手能否形成双活三/冲四+活三 → 必须立即防守！
-    best_defense = None
-    best_def_score = float('-inf')
-    
-    for r, c in moves:
-        board[r][c] = opp
-        o_live3 = []
-        o_rush4 = []
-        for dr, dc in [(1, 0), (0, 1), (1, 1), (1, -1)]:
-            count, open_ends, _ = _analyze_line(board, r, c, dr, dc, opp)
-            if count == 3 and open_ends >= 2:
-                o_live3.append((dr, dc))
-            elif count >= 4:
-                o_rush4.append((dr, dc))
-        board[r][c] = 0
-        
-        threat_level = 0
-        if len(o_live3) >= 2:
-            threat_level = 100      # 双活三：最高危
-        elif len(o_rush4) >= 2:
-            threat_level = 90       # 双冲四：高危
-        elif len(o_rush4) >= 1 and len(o_live3) >= 1:
-            threat_level = 80       # 冲四+活三：高危
-
-        if threat_level > 0:
-            def_score = threat_level * 10000 + _quick_eval_move(board, r, c, player)
-            if def_score > best_def_score:
-                best_def_score = def_score
-                best_defense = (r, c)
-
-    if best_defense and best_def_score >= 800000:
-        return best_defense
-
-    # ★★ D3修复: 多线威胁检测（防"双杀"战术）★★
-    # 人类常用的VCT战术：同时在两条线上发展，AI堵一条另一条就五连了
-    # 检测对手是否有>=2条独立的发展中线路（活三/眠四/活二+开放端）
-    opp_threat_lines = []  # list of (threat_score, blocking_positions)
-    for r, c in moves:
-        board[r][c] = opp
-        line_info = []
-        for dr, dc in [(1, 0), (0, 1), (1, 1), (1, -1)]:
-            count, open_ends, _ = _analyze_line(board, r, c, dr, dc, opp)
-            if count >= 4 and open_ends >= 1:
-                line_info.append(('rush4', 90, dr, dc))
-            elif count == 3 and open_ends >= 2:
-                line_info.append(('live3', 70, dr, dc))
-            elif count == 3 and open_ends == 1:
-                line_info.append(('sleep3', 40, dr, dc))
-            elif count == 2 and open_ends >= 2:
-                line_info.append(('live2', 15, dr, dc))
-        board[r][c] = 0
-        if line_info:
-            max_t = max(li[1] for li in line_info)
-            opp_threat_lines.append((max_t, r, c, line_info))
-
-    # 如果对手有多条高威胁线（双杀前兆），必须拦截最高威胁的
-    if len(opp_threat_lines) >= 2:
-        high_threats = [t for t in opp_threat_lines if t[0] >= 40]
-        if len(high_threats) >= 2:
-            # 对手有>=2条眠三以上的线 → 危险！选最紧急的堵
-            opp_threat_lines.sort(key=lambda x: -x[0])
-            best_block = opp_threat_lines[0]
-            return (best_block[1], best_block[2])
-
-    return None
-
-
-# ==================== 开局库 (Opening Book) ====================
-_OPENING_BOOK = {
-    # 开局局面 fen (简化) → (r, c)
-    # 空棋盘 → 天元
-    "empty": (9, 9),
-    # 天元黑子 → 斜三（常见的平衡开局）
-    "c9,9_b1": (9, 8),   # 黑天元，白走旁边
-    # 更多开局可在实战中收集
-}
-
-def _board_to_fen(board):
-    """将棋盘转为简化FEN用于开局库查询"""
-    stones = []
-    for r in range(BOARD_SIZE):
-        for c in range(BOARD_SIZE):
-            if board[r][c] != 0:
-                stones.append(f"{chr(97+c)}{r+1}_{board[r][c]}")
-    if not stones:
-        return "empty"
-    return "c" + ",".join(sorted(stones))
-
-
-def ai_move(board, ai_player, depth):
-    """
-    AI 主入口（v4 修复版 + 日志诊断）:
-    1. 开局库命中 -> 直接返回
-    2. 增强TSS 威胁检测（含防守TSS）
-    3. 时间控制 + 迭代加深（确保搜完目标深度）
-    4. Zobrist/置换表 + LMR + PVS 搜索
-
-    返回: (r, c, info_dict) — info_dict 包含决策原因/评分/深度等诊断信息
-    """
-
-    _t0 = time.time()
-    info = {'reason': 'unknown', 'depth': 0, 'actual_depth': 0,
-            'best_val': 0, 'time_ms': 0}
-
-    # === 开局库 ===
-    stone_count = np.count_nonzero(board)
-    if stone_count <= 6:
-        fen = _board_to_fen(board)
-        if fen in _OPENING_BOOK:
-            r, c = _OPENING_BOOK[fen]
-            info.update({'reason': '开局库', 'threat_detail': f'fen={fen}'})
-            return (r, c, info)
-
-    # === TSS 立即威胁检测 ===
-    # ★★ E2修复：分层威胁响应 ★★
-    # ★★ F2修复：多重威胁检测（解决25步速亡的多线牵制问题）★★
-    #
-    # 问题1（E2已修）: 旧版对所有威胁都early return，PVS整局不执行
-    # 问题2（F2新增）: 即使Level-1只拦截五连/活四，对手仍可制造多个同时威胁
-    #   日志证据(25步速亡): 步22堵K9(堵五连)→漏M12; 步24堵H8(堵五连)→漏N13
-    #   根因: 每次Level-1拦截只堵一个位置，对手用多线牵制让AI顾此失彼
-    #
-    # 新策略:
-    #   Level-1硬拦截（立即返回）：五连、活四 — 但先检查是否存在多重威胁
-    #     如果对手有>=2个五连或>=2个活四 → 常规防守已无效，转为"以攻对攻"
-    #   Level-2软建议（不返回！）：双活三/冲四+活三 — 交给PVS搜索综合判断
-    threat = _check_immediate_threat(board, ai_player)
-    threat_hint = None  # E2: Level-2威胁作为建议传给PVS，不跳过搜索
-    if threat:
-        r, c = threat
-        my_win = _find_winning_moves(board, ai_player)
-        opp_win = _find_winning_moves(board, 1 if ai_player == 2 else 2)
-        my_live4 = _find_live_four_moves(board, ai_player)
-        opp_live4 = _find_live_four_moves(board, 1 if ai_player == 2 else 2)
-
-        # ★ F2: 多重威胁检测 — 在Level-1拦截前检查是否已被多线牵制
-        # 对手同时有多个必杀位置时，常规防守必然失败
-        multi_threat_crisis = len(opp_win) >= 2 or len(opp_live4) >= 2
-
-        if multi_threat_crisis and my_win:
-            # ★★ 多重威胁危机 + AI能赢 → 先赢为敬！★★
-            info.update({'reason': '威胁检测', 'threat_detail': '多重危机-五连(赢)'})
-            return (my_win[0][0], my_win[0][1], info)
-        if multi_threat_crisis and my_live4:
-            # ★★ 多重威胁危机 + AI有活四 → 走活四必胜路径！★★
-            info.update({'reason': '威胁检测', 'threat_detail': '多重危机-活四(必胜)'})
-            return (my_live4[0][0], my_live4[0][1], info)
-        if multi_threat_crisis:
-            # ★★ 多重威胁危机但AI无必杀 → 放弃防守，转为拼命进攻模式 ★★
-            # 不再early return！让PVS搜索找最佳进攻路线
-            threat_hint = (r, c, '多重危机-放弃防守转进攻')
-            # 不要return！继续走PVS搜索路径
-
-        # Level-1：真正的终局威胁 → 必须立即响应（非多重危机时）
-        elif my_win and (r, c) in my_win:
-            info.update({'reason': '威胁检测', 'threat_detail': '五连(赢)'})
-            return (r, c, info)
-        elif opp_win and (r, c) in opp_win:
-            info.update({'reason': '威胁检测', 'threat_detail': '堵五连'})
-            return (r, c, info)
-        elif my_live4 and (r, c) in my_live4:
-            info.update({'reason': '威胁检测', 'threat_detail': '活四(必胜)'})
-            return (r, c, info)
-        elif opp_live4 and (r, c) in opp_live4:
-            info.update({'reason': '威胁检测', 'threat_detail': '堵活四'})
-            return (r, c, info)
-
-        # Level-2：双活三/冲四+活三等 → 不early return！作为建议给PVS
-        if not threat_hint:
-            threat_hint = (r, c, '双活三/冲四+活三')
-
-    moves = _generate_moves(board)
-    if not moves:
-        info['reason'] = '无走法'
-        return (9, 9, info)
-
-    # === 开局前两手优化 ===
-    if stone_count <= 1:
-        if board[9][9] == 0:
-            # 天元空闲 → 抢占中心（AI先手场景）
-            info.update({'reason': '第一步-天元'})
-            return (9, 9, info)
-        else:
-            # 天元已被人类占据 → 必须紧贴人类棋子阻挡
-            # 只评估人类棋子四周8邻位，不跳到远处
-            human_stone = None
-            for rr in range(BOARD_SIZE):
-                for cc in range(BOARD_SIZE):
-                    if board[rr][cc] != 0:
-                        human_stone = (rr, cc)
-                        break
-                if human_stone:
-                    break
-            if human_stone:
-                hr, hc = human_stone
-                nearby = []
-                for dr in range(-1, 2):
-                    for dc in range(-1, 2):
-                        if dr == 0 and dc == 0:
-                            continue
-                        nr, nc = hr + dr, hc + dc
-                        if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE and board[nr][nc] == 0:
-                            s = _quick_eval_move(board, nr, nc, ai_player)
-                            nearby.append((s, nr, nc))
-                if nearby:
-                    nearby.sort(reverse=True)
-                    best_s, r, c = nearby[0]
-                    top3 = [(s, GameLogger.coord_to_sgf(rr, cc)) for s, rr, cc in nearby[:3]]
-                    info.update({'reason': '紧贴人类第一步', 'best_val': best_s,
-                                 'top_moves': top3})
-                    return (r, c, info)
-            # 兜底：评估全部候选走法
-            best = None
-            best_s = float('-inf')
-            for r, c in moves:
-                s = _quick_eval_move(board, r, c, ai_player)
-                if s > best_s:
-                    best_s = s
-                    best = (r, c)
-            if best:
-                info.update({'reason': '响应第一步-最优', 'best_val': best_s})
-            return best
-
-    # 第二步优化：双方各1子后，优先在人类棋子周围而非远处
-    if stone_count == 2:
-        human_player = 1 if ai_player == 2 else 2
-        # 找出人类棋子的8邻位空位
-        human_nearby = set()
-        for r in range(BOARD_SIZE):
-            for c in range(BOARD_SIZE):
-                if board[r][c] == human_player:
-                    for dr in range(-1, 2):
-                        for dc in range(-1, 2):
-                            nr, nc = r + dr, c + dc
-                            if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE and board[nr][nc] == 0:
-                                human_nearby.add((nr, nc))
-        if human_nearby:
-            # 在这些紧邻位置中评估最优
-            best_s = float('-inf')
-            best = None
-            for r, c in human_nearby:
-                s = _quick_eval_move(board, r, c, ai_player)
-                if s > best_s:
-                    best_s = s
-                    best = (r, c)
-            if best and best_s > 0:
-                info.update({'reason': '紧贴人类-第二步', 'best_val': best_s})
-                return (best[0], best[1], info)
-        # 否则正常走搜索流程（fall through）
-
-    # === 时间控制 & 搜索深度（修复S2: 加深搜索让AI看到更远的杀棋组合） ===
-    _time_start = time.time()
-    # S2修复：增加搜索深度，利用迭代加深+PVS+置换表优势
-    # 目标：depth=2时搜4层，能看到"活三→活四→五连"的完整威胁链
-    if depth == 1:
-        _time_max = 1.5      # 简单: 1.5秒
-        target_depth = 2     # 搜2层
-    elif depth == 2:
-        _time_max = 3.5      # 中级: 3.5秒（S2加深：原2层→4层）
-        target_depth = 4     # 搜4层（能看到活三→冲四→五连的威胁链）
-    else:
-        _time_max = 8.0      # 高级: 8秒（S2加深：原4层→6层）
-        target_depth = 6     # 搜6层
-    _TIME_RESERVE = 0.25      # 缓冲时间
-
-    # === 走法排序（E2+E3+E4修复: 智能攻防排序） ===
-    human_player = 1 if ai_player == 2 else 2
-
-    # D4: 扫描对手的发展中线路数量，动态调整防守权重
-    opp_developing = 0
-    # ★ E3: 记录对手的"发展中长线"（慢建杀线检测）
-    # 问题：J列竖线每颗子单独不触发威胁检测，但整体是杀着
-    # 方法：找出对手所有已有>=3子的方向线，标记其空位延伸点为"高优先拦截点"
-    opp_long_lines = []  # list of (line_strength, set_of_blocking_positions)
-    for r in range(BOARD_SIZE):
-        for c in range(BOARD_SIZE):
-            if board[r][c] == human_player:
-                for dr, dc in [(1, 0), (0, 1), (1, 1), (1, -1)]:
-                    count, open_ends, _ = _analyze_line(board, r, c, dr, dc, human_player)
-                    if count >= 3 and open_ends >= 1:
-                        opp_developing += (count * open_ends)
-                        # E3: 记录这条线的延伸端点（潜在拦截位置）
-                        endpoints = set()
-                        # 向正方向找开放端
-                        nr, nc = r + dr * count, c + dc * count
-                        while 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE and board[nr][nc] == 0:
-                            endpoints.add((nr, nc))
-                            nr, nc = nr + dr, nc + dc
-                            if not (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE) or board[nr][nc] != 0:
-                                break
-                        # 向反方向找开放端
-                        nr, nc = r - dr * count, c - dc * count
-                        while 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE and board[nr][nc] == 0:
-                            endpoints.add((nr, nc))
-                            nr, nc = nr - dr, nc - dc
-                            if not (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE) or board[nr][nc] != 0:
-                                break
-                        line_str = count * 10 + open_ends  # 3子双开=32, 4子单开=41, etc.
-                        opp_long_lines.append((line_str, endpoints))
-                    elif count == 2 and open_ends >= 2:
-                        opp_developing += 2
-
-    # 基础进攻权重3x，当对手发展线多时提高防守权重
-    # ★ E4修正：即使强防守模式也保留一定进攻能力（atk_wt最低=2）
-    if opp_developing > 25:
-        atk_wt, def_wt = 2, 4   # E4: 超强防守模式（对手多条高威胁线）
-    elif opp_developing > 20:
-        atk_wt, def_wt = 2, 3   # 强防守模式
-    elif opp_developing > 12:
-        atk_wt, def_wt = 2, 2   # 平衡模式
-    else:
-        atk_wt, def_wt = 3, 1   # 正常进攻模式
-
-    # ★ E4: 反攻候选扫描 — 当对手发展线多时，寻找AI自己的进攻机会
-    # 策略："最好的防守是进攻" — 如果AI能形成活三/冲四，迫使对手防守
-    counter_attack_moves = set()
-    if opp_developing > 15:  # 对手有明显多线发展时才启用反攻
-        for r, c in moves:
-            board[r][c] = ai_player
-            for dr, dc in [(1, 0), (0, 1), (1, 1), (1, -1)]:
-                count, open_ends, _ = _analyze_line(board, r, c, dr, dc, ai_player)
-                # AI落子后能形成活三或更好 → 反攻候选
-                if count >= 3 and open_ends >= 2:
-                    counter_attack_moves.add((r, c))
-                    break
-                elif count >= 4 and open_ends >= 1:
-                    counter_attack_moves.add((r, c))
-                    break
-            board[r][c] = 0
-
-    # 构建E3的高优先拦截点集合
-    high_priority_blocks = set()
-    for _, endpoints in opp_long_lines:
-        high_priority_blocks.update(endpoints)
-
-    move_scores = []
-    for r, c in moves:
-        attack = _quick_eval_move(board, r, c, ai_player)
-        defense = _quick_eval_move(board, r, c, human_player)
-        score = attack * atk_wt + defense * def_wt
-
-        # ★ E2: threat_hint 加成 — Level-2威胁建议位获得额外加权
-        if threat_hint and (r, c) == (threat_hint[0], threat_hint[1]):
-            score += 500000  # 显著提升但不垄断
-
-        # ★ E3: 发展中长线拦截加成 — 在对手长线延伸点上加分
-        if (r, c) in high_priority_blocks:
-            score += 200000  # 中等加成，防止慢建杀线
-
-        # ★ E4: 反攻候选加成 — 当被牵制时，AI自己的进攻点额外加分
-        if (r, c) in counter_attack_moves:
-            score += 300000  # 高于普通防御但低于必堵
-
-        move_scores.append((score, r, c))
-    move_scores.sort(reverse=True)
-    max_branch_top = 15 if depth >= 2 else 12
-    if len(move_scores) > max_branch_top:
-        move_scores = move_scores[:max_branch_top]
-
-    # === Zobrist 基础哈希 ===
-    base_hash = zobrist_hash(board)
-
-    # === 迭代加深 + 时间控制 ===
-    best_move = move_scores[0][1], move_scores[0][2]
-    prev_best_val = float('-inf')
-
-    for cur_depth in range(1, target_depth + 1):
-        # 时间检查：剩余时间不足时提前停止加深（但至少完成第1层）
-        elapsed = time.time() - _time_start
-        if elapsed > _time_max - _TIME_RESERVE and cur_depth > 1:
-            break
-
-        local_best_move = best_move
-        best_val = float('-inf')
-
-        # 上次最优放第一位（迭代加深最佳实践）
-        iter_moves = []
-        for score, r, c in move_scores:
-            if (r, c) == best_move:
-                iter_moves.insert(0, (score, r, c))
-            else:
-                iter_moves.append((score, r, c))
-
-        for _, r, c in iter_moves:
-            # 每走完一个顶层节点也检查时间
-            if time.time() - _time_start > _time_max - _TIME_RESERVE:
-                break
-
-            board[r][c] = ai_player
-            if _check_win_fast(board, ai_player):
-                board[r][c] = 0
-                info.update({'reason': '搜索-发现必胜', 'actual_depth': cur_depth,
-                            'best_val': 9999999, 'time_ms': (time.time() - _t0) * 1000})
-                return (r, c, info)
-
-            new_hash = base_hash ^ _zobrist_table[ai_player - 1][r][c]
-            val = alpha_beta(board, cur_depth - 1, float('-inf'), float('inf'), False, ai_player, new_hash, ply=1)
-            board[r][c] = 0
-
-            if val > best_val:
-                best_val = val
-                local_best_move = (r, c)
-
-        best_move = local_best_move
-        info['actual_depth'] = cur_depth
-        info['best_val'] = best_val
-
-        # 启发式提前停止：仅在较深搜索且值稳定时触发（修复：提高阈值和深度要求）
-        if prev_best_val != float('-inf') and abs(best_val - prev_best_val) < 1000 and cur_depth >= 5:
-            if time.time() - _time_start > _time_max * 0.7:
-                break
-
-        prev_best_val = best_val
-
-        # 找到必胜路线（五连级=100M），提前结束
-        # ★ 修复：阈值从9M提高到95M，防止活四(50M)误触发停止
-        # 只有真正看到五连(100M)或接近五连时才提停，且至少搜2层
-        if best_val > 95000000 and cur_depth >= 2:
-            break
-
-    # 收集前3候选走法用于日志
-    top_moves = [(s, GameLogger.coord_to_sgf(r, c))
-                 for s, r, c in move_scores[:3]]
-
-    elapsed_ms = (time.time() - _t0) * 1000
-
-    # ★ G2+G3: 拼命模式（PVS返回极低分时切换以攻对攻+紧急防守策略）
-    # 日志证据(25步速亡): 步18 PVS返回val=-10000000，AI已知道自己要输了
-    # 但之后步20/22/24仍走被动防守，最终被多线牵制致死
-    #
-    # 日志证据(31步速亡): 步30拼命模式选了M12(纯进攻)，但G7才是人类杀位！
-    # 根因：旧版拼命模式只扫描AI自己的活三/冲四，完全不看对手威胁
-    #
-    # 修复：混合攻防 — 在进攻的同时，必须拦截对手的准杀位
-    DESPERATION_THRESHOLD = -5000000
-    if best_val <= DESPERATION_THRESHOLD:
-        my_win = _find_winning_moves(board, ai_player)
-        my_live4 = _find_live_four_moves(board, ai_player)
-        human = 1 if ai_player == 2 else 2
-
-        if my_win:
-            info.update({'reason': '威胁检测', 'threat_detail': '拼命-五连(赢)',
-                        'depth': target_depth, 'time_ms': elapsed_ms, 'top_moves': top_moves})
-            return (my_win[0][0], my_win[0][1], info)
-        if my_live4:
-            info.update({'reason': '威胁检测', 'threat_detail': '拼命-活四(必胜)',
-                        'depth': target_depth, 'time_ms': elapsed_ms, 'top_moves': top_moves})
-            return (my_live4[0][0], my_live4[0][1], info)
-
-        # ★ G3: 拼命模式中的紧急防守 — 扫描对手的所有准杀位
-        # 准杀位定义：
-        #   1. 对手落子后能形成活四的位置（opp_live4 moves）
-        #   2. 对手落子后能形成五连的位置（opp_win moves）— 最优先！
-        #   3. 对手已有的"发展中长线"(>=3子)的延伸空位
-        opp_win = _find_winning_moves(board, human)
-        opp_live4 = _find_live_four_moves(board, human)
-
-        # 收集对手的准杀位（高优拦截点）
-        critical_blocks = set()
-        if opp_win:
-            critical_blocks.update(opp_win)  # 五连位 — 最高优先级
-        if opp_live4:
-            critical_blocks.update(opp_live4)  # 活四位 — 极高优先级
-
-        # 扫描对手的发展中长线延伸点（同E3逻辑）
-        for r in range(BOARD_SIZE):
-            for c in range(BOARD_SIZE):
-                if board[r][c] == human:
-                    for dr, dc in [(1, 0), (0, 1), (1, 1), (1, -1)]:
-                        cnt, opens, _ = _analyze_line(board, r, c, dr, dc, human)
-                        if cnt >= 3 and opens >= 1:
-                            nr, nc = r + dr * (cnt + 1), c + dc * (cnt + 1)
-                            if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE and board[nr][nc] == 0:
-                                critical_blocks.add((nr, nc))
-                            nr2, nc2 = r - dr, c - dc
-                            if 0 <= nr2 < BOARD_SIZE and 0 <= nc2 < BOARD_SIZE and board[nr2][nc2] == 0:
-                                critical_blocks.add((nr2, nc2))
-
-        # ★ G2: 混合攻防评分 — 进攻+防守综合评估
-        best_desp_val = float('-inf')
-        best_desp_move = best_move
-
-        for r, c in [m[1:] for m in move_scores]:
-            atk_score = _quick_eval_move(board, r, c, ai_player)
-            def_score = _quick_eval_move(board, r, c, human)
-
-            # 进攻检查：AI落子后能否形成强攻击
-            board[r][c] = ai_player
-            has_strong_threat = False
-            for dr, dc in [(1, 0), (0, 1), (1, 1), (1, -1)]:
-                cnt, opens, _ = _analyze_line(board, r, c, dr, dc, ai_player)
-                if (cnt >= 3 and opens >= 2) or (cnt >= 4 and opens >= 1):
-                    has_strong_threat = True
-                    break
-            board[r][c] = 0
-
-            final_score = atk_score * 2 + def_score * 2  # 攻防并重
-
-            # ★ G3核心：准杀位拦截加成 — 远超普通攻击
-            if (r, c) in critical_blocks:
-                if opp_win and (r, c) in opp_win:
-                    final_score += 100000000  # 堵五连 > 一切
-                elif opp_live4 and (r, c) in opp_live4:
-                    final_score += 80000000  # 堵活四 > 一切
-                else:
-                    final_score += 30000000  # 长线延伸拦截（高优但非绝对）
-
-            if has_strong_threat:
-                final_score += 500000  # 自身攻击加成
-
-            if final_score > best_desp_val:
-                best_desp_val = final_score
-                best_desp_move = (r, c)
-
-        info.update({
-            'reason': 'PVS搜索',
-            'threat_detail': f'拼命模式-攻防混合(PVS={best_val}, blocks={len(critical_blocks)})',
-            'depth': target_depth,
-            'best_val': best_val,
-            'time_ms': elapsed_ms,
-            'top_moves': top_moves,
-        })
-        return (best_desp_move[0], best_desp_move[1], info)
-
-    info.update({
-        'reason': 'PVS搜索',
-        'depth': target_depth,
-        'time_ms': elapsed_ms,
-        'top_moves': top_moves,
-    })
-    return (best_move[0], best_move[1], info)
+import analysis
+import anim
+import board_render
+import charts
+import theme
+from board_geometry import BoardGeometry
+from engine import (BOARD_SIZE, Board, ai_move, check_win, evaluate, is_mate,
+                    new_game, opening_move, win_line)
+from gamelog import GameLogger
+from ui_kit import (BrandMark, InfoRow, Screen, StoneFace, TurnIndicator,
+                    button, card_button, faint_label, hbox, separator,
+                    stone_row, title_label)
+
+# ==================== 界面常量 ====================
+CELL_SIZE = 34                      # 设计基准：格距
+# 19 个格点之间只有 **18 段**。旧代码写 `BOARD_SIZE * CELL_SIZE`，把格点当成了
+# 段，于是网格右／下各比左／上多出一个格距，棋盘看着是偏的。
+BOARD_SPAN = (BOARD_SIZE - 1) * CELL_SIZE      # 612
+BOARD_PAD = 57                      # 网格到木盘边（要容下坐标标注）
+MARGIN = BOARD_PAD                  # 设计基准下网格原点的偏移
+BOARD_PX = BOARD_SPAN + 2 * BOARD_PAD          # 726 —— 棋盘控件设计边长
+PANEL_W = theme.PANEL_W                        # 264 —— 面板宽度（唯一真源）
+GAP = theme.SPACE_MD                           # 12  —— 棋盘/面板与窗口边缘
+WINDOW_W = GAP + BOARD_PX + theme.SPACE_SM + PANEL_W + GAP   # 1022
+WINDOW_H = GAP + BOARD_PX + GAP                              # 750
+
+# ---- 缩放下限 ----
+# 棋盘不再定死 726×726：小屏（1366×768）上旧窗口 1022×750 连标题栏一起摆不下，
+# 底部按钮会被屏幕边缘吃掉。改为「窗口有下限、棋盘按控件尺寸等比缩放」。
+MIN_CELL = 22                       # 最小格距；再小坐标标注会糊成一团
+# 木盘边距（坐标标注带）随几何等比缩放，占设计边长的比例是固定的，所以
+# 要反推「格距恰好 22 时棋盘控件该多宽」而不是拍一个数：
+#   控件宽 = 18*cell / (1 - 2*边距占比)
+# （plan 里写的 456 是按边距绝对值 30 算的，反推回来 cell 只有 21.4，
+#   够不上 22 这条下限，所以这里从真实比例推。）
+_PAD_FRAC = BOARD_PAD / BOARD_PX                     # 57/726 ≈ 0.0785
+MIN_BOARD = math.ceil((BOARD_SIZE - 1) * MIN_CELL / (1.0 - 2.0 * _PAD_FRAC))  # 470
+MIN_W = GAP + MIN_BOARD + theme.SPACE_SM + PANEL_W + GAP     # 766
+# 高度下限由**面板**而不是棋盘决定：面板里现在挂着两张图表卡，它的
+# minimumSizeHint 比棋盘那一列高。这个数只是兜底，真值在 `_build_game_ui`
+# 里按实测重算（它依赖字体度量，需要 QApplication，写不成模块常量）。
+#
+# **上限是 MIN_W**：`tests/test_board_geometry.py` 断言 MIN_W > MIN_H，因为
+# 棋盘取 min(w, h) 定格距 —— 高度超过宽度后，再高的窗口也只会给棋盘上下
+# 加留白，格距不再增长。所以 MIN_H 不许越过 766。
+MIN_H = 494
+MAX_SCALE = 1.35                    # 初始尺寸上限：棋盘再大就一眼看不全 19 路了
+
+# 棋盘几何的设计基准（1:1）。绘制、命中判定、无头测试全部经由它，
+# 不要再在别处写第二份 `MARGIN + c * CELL_SIZE`。
+_DESIGN_GEOM = BoardGeometry.design(BOARD_SIZE, CELL_SIZE, MARGIN)
+
+# 调色板一律来自 theme —— 这里刻意**不再**声明任何 QColor 常量。
+# `_qss_color()` 也随之删除：只要主题层不产出 QColor，"QColor 插进样式表变成
+# 非法 CSS、Qt 静默丢弃整条规则"这个曾经真实发生过的 bug 在结构上就不可能出现。
 
 
 # ==================== AI Worker 线程 ====================
 class AIWorker(QThread):
-    """AI计算线程，避免阻塞UI — 返回 (r, c, info_dict)"""
+    """AI计算线程，避免阻塞UI — 返回 (r, c, info_dict)
+
+    取消是**协作式**的：cancel() 置位 Event，引擎在搜索循环里轮询到之后
+    主动退出。原版用的是 QThread.terminate()，它会在任意字节码处强杀线程；
+    搜索正在做棋盘 make/unmake 时被强杀，会留下不一致的状态。
+    """
     finished = pyqtSignal(int, int, object)  # (row, col, info_dict)
 
     def __init__(self, board, ai_player, depth):
@@ -1963,667 +95,680 @@ class AIWorker(QThread):
         self.board = board.copy()
         self.ai_player = ai_player
         self.depth = depth
+        self._cancel = threading.Event()
+
+    def cancel(self):
+        """请求取消搜索。线程会在下一次节点轮询时退出。"""
+        self._cancel.set()
 
     def run(self):
-        r, c, info = ai_move(self.board, self.ai_player, self.depth)
+        try:
+            r, c, info = ai_move(self.board, self.ai_player, self.depth,
+                                 cancel=self._cancel)
+        except Exception as exc:
+            # 引擎异常不应让线程静默死掉、把 UI 永远卡在"思考中"
+            self.finished.emit(-1, -1, {'reason': 'AI异常', 'best_val': 0.0,
+                                        'detail': f'{type(exc).__name__}: {exc}'})
+            return
         self.finished.emit(r, c, info)
 
 
-# ==================== 棋子动画 ====================
-class StoneAnimation(QPropertyAnimation):
-    """棋子落下动画"""
-    pass
-
-
 # ==================== 加载界面 ====================
-class LoadingScreen(QWidget):
-    """模拟加载界面"""
+SPLASH_MS = 900     # 开场交接时长；真实启动成本约 115ms，见下
+# 进度条步进间隔。15ms ≈ 66fps，肉眼连续；步数 60 也够让"在推进"看得清。
+_SPLASH_TICK_MS = 15
+
+
+class LoadingScreen(Screen):
+    """开场交接动画。
+
+    **进度条走的是"交接倒计时"而不是"加载进度"。** 真实启动成本约 115ms
+    （``import numpy`` 85ms + ``import engine`` 16ms + ``new_game()`` 14ms），
+    而其中最重的一步发生在 ``QApplication`` 构造**之前** —— 用户看到这一屏
+    时，"最重的那件事"早已做完。所以这里不演百分比数字（旧版演 5000ms，与
+    真实成本差 43 倍，是纯粹的谎言），只如实显示这屏还要停留多久：QTimer
+    按 ``SPLASH_MS`` 推进 0→100。同理，那八条"正在加载开局库..."式的假步骤
+    一并删除 —— 开局库在模块拆分时就没了，GPU 分支也恒为 CPU。
+
+    **为什么保留而不是直接删掉。** 冷启动时用户已等了 OS 几百毫秒，硬切会
+    显得突兀；而且这一屏是唯一能承载"未找到中文字体"警告的位置。
+
+    视觉上是**棋盘的缩影**：一块木牌（材质与真棋盘同源，见
+    ``board_render.brand_mark``）压住标题，进度条压在下面收尾。纯文字排版
+    的问题是它可以是任何一个应用的开场页；而木牌一出现，"这是那个下棋的
+    应用"在第一帧就成立了。
+    """
+
+    # 木牌边长。载荷只有网格与两子，超过这个尺寸线距会显空。
+    _MARK_PX = 104
 
     def __init__(self, on_finished):
-        super().__init__()
+        super().__init__(title="五 子 棋", subtitle="Gomoku AI",
+                         lead=BrandMark(self._MARK_PX), backdrop=True)
         self.on_finished = on_finished
-        self.progress = 0
-        self.dot_count = 0
-        self.tip_index = 0
-        # 根据实际 GPU 类型动态生成提示
-        gpu_type = get_gpu_type()
-        if gpu_type == 'cuda':
-            gpu_tip = "正在优化NVIDIA CUDA计算图..."
-        elif gpu_type == 'xpu':
-            gpu_tip = "正在优化Intel XPU计算图..."
-        else:
-            gpu_tip = "正在优化CPU计算引擎..."
-        self.tips = [
-            "正在初始化游戏引擎...",
-            "正在加载开局库...",
-            "正在构建Zobrist哈希表...",
-            "正在构建棋型评估权重...",
-            gpu_tip,
-            "正在准备棋盘渲染管线...",
-            "正在校准威胁搜索参数...",
-            "游戏准备完成！"
-        ]
         self.setup_ui()
 
-        # 进度定时器
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_loading)
-        self.timer.start(30)
-
-        # 动画定时器
-        self.dot_timer = QTimer(self)
-        self.dot_timer.timeout.connect(self.update_dots)
-        self.dot_timer.start(500)
-
-        self.start_time = time.time()
-
     def setup_ui(self):
-        self.setStyleSheet("background: transparent;")
-
-        layout = QVBoxLayout()
-        layout.setAlignment(Qt.AlignCenter)
-
-        # 标题
-        self.title = QLabel("五 子 棋")
-        self.title.setAlignment(Qt.AlignCenter)
-        self.title.setStyleSheet("""
-            QLabel {
-                color: #cdd6f4;
-                font-size: 48px;
-                font-weight: bold;
-                font-family: 'Microsoft YaHei', 'SimHei', sans-serif;
-                letter-spacing: 20px;
-            }
-        """)
-
-        # 副标题
-        subtitle = QLabel("Gomoku AI · PyTorch Engine")
-        subtitle.setAlignment(Qt.AlignCenter)
-        subtitle.setStyleSheet("""
-            QLabel {
-                color: #a6adc8;
-                font-size: 14px;
-                font-family: 'Consolas', 'Microsoft YaHei', monospace;
-            }
-        """)
-
-        # Loading文字
-        self.loading_label = QLabel("Loading")
-        self.loading_label.setAlignment(Qt.AlignCenter)
-        self.loading_label.setStyleSheet("""
-            QLabel {
-                color: #89b4fa;
-                font-size: 18px;
-                font-family: 'Consolas', monospace;
-            }
-        """)
-
-        # 进度条
         self.progress_bar = QProgressBar()
+        # 定量条（0→100）+ 主题 chunk。**不要**改成 setRange(0, 0)：不定量条
+        # 在 Fusion 下会画成一整条默认蓝（既非主题色也无可见动画），
+        # 而给它写 ::chunk 又会盖掉 busy 动画、条直接变空。详见 theme.py 注释。
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(False)
-        self.progress_bar.setFixedHeight(6)
-        self.progress_bar.setFixedWidth(400)
-        self.progress_bar.setStyleSheet("""
-            QProgressBar {
-                background-color: #313244;
-                border-radius: 3px;
-                border: none;
-            }
-            QProgressBar::chunk {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #89b4fa, stop:0.5 #a6e3a1, stop:1 #89b4fa);
-                border-radius: 3px;
-            }
-        """)
+        # 5px：与 32px 标题、14px 副标题同处一屏时，6px 会显得像根横梁。
+        self.progress_bar.setFixedHeight(5)
+        self.progress_bar.setFixedWidth(300)
+        self.add_content(self.progress_bar)
 
-        # 百分比
-        self.percent_label = QLabel("0%")
-        self.percent_label.setAlignment(Qt.AlignCenter)
-        self.percent_label.setStyleSheet("color: #cdd6f4; font-size: 24px; font-weight: bold;")
+        self._elapsed = QElapsedTimer()
+        self._elapsed.start()
+        self._tick = QTimer(self)
+        self._tick.setInterval(_SPLASH_TICK_MS)
+        self._tick.timeout.connect(self._advance)
+        self._tick.start()
 
-        # 提示文字
-        self.tip_label = QLabel(self.tips[0])
-        self.tip_label.setAlignment(Qt.AlignCenter)
-        self.tip_label.setStyleSheet("color: #6c7086; font-size: 13px; font-family: 'Microsoft YaHei';")
+        if not theme.has_cjk_font():
+            self.add_footer(faint_label(
+                "未找到简体中文字体，界面可能显示为方块；"
+                "Linux 请安装 fonts-noto-cjk"))
 
-        # 版权
-        gpu_label = {"cuda": "NVIDIA CUDA", "xpu": "Intel XPU", "cpu": "CPU"}.get(get_gpu_type(), "CPU")
-        copyright_label = QLabel(f"基于 PVS+LMR · 专业权重 · TSS攻防搜索 · {gpu_label}加速")
-        copyright_label.setAlignment(Qt.AlignCenter)
-        copyright_label.setStyleSheet("color: #45475a; font-size: 11px; font-family: 'Consolas', monospace;")
+    def _advance(self):
+        """按 SPLASH_MS 线性推进进度条；走满即停表并交接。
 
-        layout.addStretch(2)
-        layout.addWidget(self.title)
-        layout.addSpacing(10)
-        layout.addWidget(subtitle)
-        layout.addSpacing(40)
-        layout.addWidget(self.loading_label, alignment=Qt.AlignCenter)
-        layout.addSpacing(15)
-        layout.addWidget(self.progress_bar, alignment=Qt.AlignCenter)
-        layout.addSpacing(10)
-        layout.addWidget(self.percent_label)
-        layout.addSpacing(10)
-        layout.addWidget(self.tip_label)
-        layout.addStretch(3)
-        layout.addWidget(copyright_label)
-        layout.addSpacing(30)
-
-        self.setLayout(layout)
-
-    def update_loading(self):
-        elapsed = time.time() - self.start_time
-        duration = 5.0  # 加载总时长
-        self.progress = min(elapsed / duration, 1.0)
-        pct = int(self.progress * 100)
-        self.progress_bar.setValue(pct)
-        self.percent_label.setText(f"{pct}%")
-
-        # 更新提示
-        new_tip = min(int(self.progress * (len(self.tips) - 1)), len(self.tips) - 1)
-        if new_tip != self.tip_index:
-            self.tip_index = new_tip
-            self.tip_label.setText(self.tips[self.tip_index])
-
-        if self.progress >= 1.0:
-            self.timer.stop()
-            self.dot_timer.stop()
-            self.loading_label.setText("Ready!")
-            self.tip_label.setText(self.tips[-1])
-            # 延迟跳转
-            QTimer.singleShot(800, self.on_finished)
-
-    def update_dots(self):
-        self.dot_count = (self.dot_count + 1) % 4
-        if self.progress < 1.0:
-            self.loading_label.setText("Loading" + "." * self.dot_count)
+        用已流逝的墙钟而非累加步数：QTimer 在系统繁忙时会丢拍，累加会让
+        进度条慢于实际交接时刻，出现"跳到 80% 就切页"的观感。
+        """
+        elapsed = self._elapsed.elapsed()
+        if elapsed >= SPLASH_MS:
+            self._tick.stop()
+            self.progress_bar.setValue(100)
+            self.on_finished()
+            return
+        self.progress_bar.setValue(int(elapsed * 100 / SPLASH_MS))
 
 
 # ==================== 游戏棋盘组件 ====================
 class BoardWidget(QWidget):
-    """棋盘绘制组件"""
+    """棋盘绘制组件。
+
+    **自身不涂任何背景。** 木盘是圆角的，控件矩形四角那四块深色三角必须由父
+    容器透出来 —— 一旦给这个控件设了 QSS 背景或 ``WA_StyledBackground``，圆角
+    就没有意义了，整个控件会变成一个方方正正的橙色块。
+
+    绘制分三层（详见 ``board_render``）：静态层与棋子层各自缓存成 pixmap，
+    ``paintEvent`` 里只剩两次 ``drawPixmap`` 加最后手环／悬停幽灵两个小图形。
+    """
 
     def __init__(self):
         super().__init__()
         self.board = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=int)
         self.last_move = None  # (r, c, player)
         self.hover_pos = None
-        self.setFixedSize(BOARD_PX + MARGIN * 2, BOARD_PX + MARGIN * 2)
+        self.hover_player = 1  # 幽灵子显示谁的颜色
+        self.geom = _DESIGN_GEOM      # 像素<->格子的唯一真源
+        self._static = None           # 缓存：静态层
+        self._stones = None           # 缓存：棋子层
+        self._cache_key = None        # (w, h, dpr) —— 变化即重建
+        self._stones_dirty = True
+        # 落子动画：正在动画的那颗子**不在**棋子缓存层里，由 paintEvent
+        # 覆盖绘制（下落位移 + 淡入），结束时并回缓存层。
+        self._anim = None             # QVariantAnimation
+        self._anim_cell = None        # (r, c, player)
+        self.win_cells = []           # 终局五连 [(r, c), ...]
+        self.win_player = 0
+        # 下限与窗口下限同源：MIN_BOARD 正是「格距恰好 MIN_CELL」。写死一个
+        # 360 会让两处下限脱钩 —— 窗口允许缩到棋盘只剩 360 宽时，格距掉到
+        # 16.9，坐标标注直接糊没。
+        self.setMinimumSize(MIN_BOARD, MIN_BOARD)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMouseTracking(True)
-        self.setStyleSheet("background: transparent;")
+
+    def cell_center(self, r, c) -> QPoint:
+        """格点 ``(r, c)`` 的中心在控件内的像素坐标。
+
+        供派发鼠标事件使用（``_on_board_click`` / 无头冒烟测试）。**不要在
+        调用方自己算 ``MARGIN + c * CELL_SIZE``** —— 那个公式只在设计尺寸下
+        成立，棋盘一旦可缩放就会把点击投到错误的格子上。
+        """
+        x, y = self.geom.px(r, c)
+        return QPoint(round(x), round(y))
 
     def set_board(self, board):
         self.board = board.copy()
+        self._stones_dirty = True
         self.update()
 
     def set_last_move(self, r, c, player):
         if r is None or c is None:
             self.last_move = None
+            self._cancel_stone_anim()   # 悔棋/重置：取消在途的落子动画
         else:
             self.last_move = (r, c, player)
+            self._start_stone_anim(r, c, player)
+        self.update()          # 只画一个环，不必重建棋子层
+
+    def set_win_cells(self, cells, player):
+        """终局五连高亮（``cells`` 来自 ``engine.win_line``）。"""
+        self.win_cells = list(cells) if cells else []
+        self.win_player = player
         self.update()
+
+    # ---- 落子动画 ----
+
+    def _cancel_stone_anim(self):
+        """立刻终止在途动画并把该子并回缓存层。
+
+        Qt 的 ``stop()`` 在动画**未到终点**时不发 ``finished``（只有走完
+        duration 才发），所以收尾必须手动做 —— 否则悔棋后那颗已不存在的子
+        会继续被排除在缓存层外、被动画层绘制 160ms。
+        """
+        if self._anim is None:
+            return
+        self._anim.stop()
+        self._anim = None
+        cell = self._anim_cell[:2] if self._anim_cell else None
+        self._anim_cell = None
+        self._stones_dirty = True
+        if cell is not None:
+            self._repaint_cell(cell)
+
+    def _start_stone_anim(self, r, c, player):
+        """启动落子的覆盖式动画。
+
+        动画期间该子被 ``render_stones(exclude=...)`` 排除出缓存层，
+        ``paintEvent`` 在缓存层之上单独绘制它（位移 + 淡入）；结束时
+        重建缓存层把它并回去 —— 结束帧与静态帧逐像素重合，无跳变。
+
+        **先收掉旧动画再置新状态**：AI 极快响应时上一手动画可能还没放完，
+        旧子必须先并回缓存层，否则它会在两段动画的间隙里凭空消失。
+        """
+        self._cancel_stone_anim()
+        self._anim_cell = (r, c, player)
+        self._stones_dirty = True
+        anim_obj = QVariantAnimation(self)
+        anim_obj.setDuration(anim.STONE_MS)
+        anim_obj.setStartValue(0.0)
+        anim_obj.setEndValue(1.0)
+        anim_obj.setEasingCurve(QEasingCurve.OutCubic)
+        cell = (r, c)
+        anim_obj.valueChanged.connect(lambda _: self._repaint_cell(cell))
+        anim_obj.finished.connect(lambda: self._finish_stone_anim(cell))
+        self._anim = anim_obj
+        anim_obj.start()
+
+    def _finish_stone_anim(self, cell):
+        """动画收尾：该子并回缓存层。"""
+        self._anim = None
+        self._anim_cell = None
+        self._stones_dirty = True
+        self._repaint_cell(cell)
+
+    def set_hover_player(self, player):
+        """设置幽灵子的颜色（``1``/``2``）；传 ``None`` 表示当前不该有悬停预览
+        （AI 思考中、对局已结束）。"""
+        if player != self.hover_player:
+            self.hover_player = player
+            self.update()
+
+    def resizeEvent(self, event):
+        # 几何随控件尺寸等比缩放，网格重新居中且保持正方。缓存全部作废。
+        self.geom = BoardGeometry.fit(self.width(), self.height(), _DESIGN_GEOM)
+        self._static = None
+        self._stones = None
+        self._cache_key = None
+        self._stones_dirty = True
+        super().resizeEvent(event)
+
+    def _ensure_cache(self):
+        """按 (尺寸, DPR) 惰性重建缓存。DPR 变化（拖到另一块屏）也走这里。"""
+        dpr = self.devicePixelRatioF()
+        key = (self.width(), self.height(), round(dpr, 2))
+        if key == self._cache_key:
+            return
+        self._cache_key = key
+        self._static = board_render.render_static(
+            self.geom, self.width(), self.height(), dpr)
+        self._stones = None
+        self._stones_dirty = True
+
+    def _repaint_cell(self, cell):
+        """只重绘一个格子（含棋子向外溢出的投影余量）。"""
+        if cell is None:
+            return
+        x, y, w, h = self.geom.cell_rect(cell[0], cell[1])
+        pad = self.geom.cell * 0.5
+        self.update(QRect(int(x - pad), int(y - pad),
+                          int(w + 2 * pad), int(h + 2 * pad)))
 
     def mouseMoveEvent(self, event: QMouseEvent):
-        x, y = event.x(), event.y()
-        if MARGIN <= x <= MARGIN + (BOARD_SIZE - 1) * CELL_SIZE and \
-           MARGIN <= y <= MARGIN + (BOARD_SIZE - 1) * CELL_SIZE:
-            c = round((x - MARGIN) / CELL_SIZE)
-            r = round((y - MARGIN) / CELL_SIZE)
-            if 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE:
-                self.hover_pos = (r, c)
-                self.update()
-                return
-        self.hover_pos = None
-        self.update()
+        # 同格内移动直接返回 —— 旧实现是无条件整盘重绘，鼠标每动一像素就
+        # 重建上百个渐变对象。
+        cell = self.geom.to_grid(event.x(), event.y())
+        if cell == self.hover_pos:
+            return
+        old, self.hover_pos = self.hover_pos, cell
+        self._repaint_cell(old)
+        self._repaint_cell(cell)
 
     def leaveEvent(self, event):
-        self.hover_pos = None
-        self.update()
+        old, self.hover_pos = self.hover_pos, None
+        self._repaint_cell(old)
 
     def paintEvent(self, event):
+        self._ensure_cache()
         painter = QPainter(self)
+
+        painter.drawPixmap(0, 0, self._static)
+
+        if self._stones_dirty or self._stones is None:
+            exclude = self._anim_cell[:2] if self._anim_cell else None
+            self._stones = board_render.render_stones(
+                self.geom, self.width(), self.height(),
+                self.devicePixelRatioF(), self.board, exclude=exclude)
+            self._stones_dirty = False
+        painter.drawPixmap(0, 0, self._stones)
+
         painter.setRenderHint(QPainter.Antialiasing, True)
+        r = self.geom.stone_radius
 
-        # 背景
-        bg_grad = QRadialGradient(self.width() / 2, self.height() / 2,
-                                   max(self.width(), self.height()))
-        bg_grad.setColorAt(0, QColor("#e8c97a"))
-        bg_grad.setColorAt(1, QColor("#c4943a"))
-        painter.setBrush(QBrush(bg_grad))
-        painter.setPen(Qt.NoPen)
-        painter.drawRoundedRect(0, 0, self.width(), self.height(), 10, 10)
+        # 落子动画：正在动画的子不在缓存层里，带下落位移与淡入覆盖绘制。
+        if self._anim_cell is not None:
+            ar, ac, ap = self._anim_cell
+            x, y = self.geom.px(ar, ac)
+            t = float(self._anim.currentValue()) if self._anim is not None else 1.0
+            drop = anim.STONE_DROP_PX * self.geom.k * (1.0 - t)
+            alpha = anim.STONE_FADE_FROM + (1.0 - anim.STONE_FADE_FROM) * t
+            d = r * 2.0
+            sprite = board_render.stone_sprite(ap, d, self.devicePixelRatioF())
+            half = d * board_render._SPRITE_SCALE / 2.0
+            painter.setOpacity(alpha)
+            painter.drawPixmap(QPointF(x - half, y - half - drop), sprite)
+            painter.setOpacity(1.0)
 
-        # 棋盘木纹背景
-        board_rect = QRect(MARGIN - 15, MARGIN - 15,
-                           (BOARD_SIZE - 1) * CELL_SIZE + 30,
-                           (BOARD_SIZE - 1) * CELL_SIZE + 30)
-        painter.setBrush(QBrush(QColor("#dcb35c")))
-        painter.setPen(Qt.NoPen)
-        painter.drawRoundedRect(board_rect, 8, 8)
-
-        # 网格线
-        pen = QPen(QColor("#5a3a1a"), 1.5)
-        painter.setPen(pen)
-        for i in range(BOARD_SIZE):
-            y = MARGIN + i * CELL_SIZE
-            painter.drawLine(MARGIN, y, MARGIN + (BOARD_SIZE - 1) * CELL_SIZE, y)
-        for i in range(BOARD_SIZE):
-            x = MARGIN + i * CELL_SIZE
-            painter.drawLine(x, MARGIN, x, MARGIN + (BOARD_SIZE - 1) * CELL_SIZE)
-
-        # 星位
-        star_points = [
-            (3, 3), (3, 9), (3, 15),
-            (9, 3), (9, 9), (9, 15),
-            (15, 3), (15, 9), (15, 15)
-        ]
-        painter.setBrush(QBrush(QColor("#3a1a0a")))
-        painter.setPen(Qt.NoPen)
-        for r, c in star_points:
-            x = MARGIN + c * CELL_SIZE
-            y = MARGIN + r * CELL_SIZE
-            painter.drawEllipse(QPoint(x, y), 4, 4)
-
-        # 坐标标注
-        coord_font = QFont("Consolas", 9)
-        painter.setFont(coord_font)
-        painter.setPen(QColor("#5a3a1a"))
-        for i in range(BOARD_SIZE):
-            x = MARGIN + i * CELL_SIZE
-            painter.drawText(QRect(x - 10, MARGIN - 25, 20, 20),
-                             Qt.AlignCenter, chr(65 + i) if i < 26 else str(i))
-            y = MARGIN + i * CELL_SIZE
-            painter.drawText(QRect(MARGIN - 35, y - 10, 30, 20),
-                             Qt.AlignCenter, str(i + 1))
-
-        # 绘制棋子
-        for r in range(BOARD_SIZE):
-            for c in range(BOARD_SIZE):
-                if self.board[r][c] != 0:
-                    self._draw_stone(painter, r, c, self.board[r][c])
-
-        # 最后一手高亮
-        if self.last_move:
-            r, c, player = self.last_move
-            x = MARGIN + c * CELL_SIZE
-            y = MARGIN + r * CELL_SIZE
-            painter.setPen(QPen(QColor("#ff6b6b"), 2))
+        # 终局五连：贯穿光带 + 每颗子一个环（色同最后一手环 —— 墨色只有一份）
+        if self.win_cells:
+            first, last = self.win_cells[0], self.win_cells[-1]
+            x0, y0 = self.geom.px(*first)
+            x1, y1 = self.geom.px(*last)
+            win_col = QColor(theme.LAST_LIGHT if self.win_player == 1
+                             else theme.LAST_DARK)
+            band = QColor(win_col)
+            band.setAlpha(80)
+            band_pen = QPen(band, r * 1.1)
+            band_pen.setCapStyle(Qt.RoundCap)
             painter.setBrush(Qt.NoBrush)
-            painter.drawEllipse(QPoint(x, y), CELL_SIZE // 2 - 2, CELL_SIZE // 2 - 2)
+            painter.setPen(band_pen)
+            painter.drawLine(QPointF(x0, y0), QPointF(x1, y1))
+            ring = QPen(win_col, max(2.0, r * 0.26))
+            painter.setPen(ring)
+            for rr, cc in self.win_cells:
+                x, y = self.geom.px(rr, cc)
+                painter.drawEllipse(QPointF(x, y), r * 0.78, r * 0.78)
 
-        # 悬停预览
-        if self.hover_pos and self.board[self.hover_pos[0]][self.hover_pos[1]] == 0:
-            r, c = self.hover_pos
-            x = MARGIN + c * CELL_SIZE
-            y = MARGIN + r * CELL_SIZE
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(QColor(128, 128, 128, 80)))
-            painter.drawEllipse(QPoint(x, y), CELL_SIZE // 2 - 2, CELL_SIZE // 2 - 2)
+        # 最后一手：与棋子**反色**的环。旧的固定红圈叠在白子上只有 2.1:1，
+        # 叠在黑子上也发闷。
+        if self.last_move:
+            lr, lc, player = self.last_move
+            x, y = self.geom.px(lr, lc)
+            color = theme.LAST_LIGHT if player == 1 else theme.LAST_DARK
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(color), max(1.5, r * 0.22)))
+            painter.drawEllipse(QPointF(x, y), r * 0.72, r * 0.72)
+
+        # 悬停：幽灵子（半透明的"你将落下的那颗子"）。旧的灰盘压在木色上
+        # 几乎看不见。描边用棋盘墨色 GRID（浅色主题的 ACCENT 对木色不够）。
+        if (self.hover_player and self.hover_pos
+                and self.board[self.hover_pos[0]][self.hover_pos[1]] == 0):
+            hr, hc = self.hover_pos
+            x, y = self.geom.px(hr, hc)
+            base = theme.STONE_B if self.hover_player == 1 else theme.STONE_W
+            ghost = QColor(base)
+            ghost.setAlpha(120)
+            painter.setPen(QPen(QColor(theme.GRID), max(1.0, r * 0.12)))
+            painter.setBrush(QBrush(ghost))
+            painter.drawEllipse(QPointF(x, y), r, r)
 
         painter.end()
 
-    def _draw_stone(self, painter, r, c, player):
-        x = MARGIN + c * CELL_SIZE
-        y = MARGIN + r * CELL_SIZE
-        radius = CELL_SIZE // 2 - 3
-
-        if player == 1:  # 黑棋
-            grad = QRadialGradient(x - radius * 0.3, y - radius * 0.3, radius * 1.2)
-            grad.setColorAt(0, QColor("#555555"))
-            grad.setColorAt(0.7, QColor("#1a1a1a"))
-            grad.setColorAt(1, QColor("#000000"))
-            painter.setBrush(QBrush(grad))
-            painter.setPen(QPen(QColor("#333333"), 1))
-        else:  # 白棋
-            grad = QRadialGradient(x - radius * 0.3, y - radius * 0.3, radius * 1.2)
-            grad.setColorAt(0, QColor("#ffffff"))
-            grad.setColorAt(0.6, QColor("#e8e8e8"))
-            grad.setColorAt(1, QColor("#c0c0c0"))
-            painter.setBrush(QBrush(grad))
-            painter.setPen(QPen(QColor("#999999"), 1))
-
-        painter.drawEllipse(QPoint(x, y), radius, radius)
-
     def get_grid_pos(self, screen_x, screen_y):
-        """屏幕坐标转棋盘坐标"""
-        if MARGIN <= screen_x <= MARGIN + (BOARD_SIZE - 1) * CELL_SIZE and \
-           MARGIN <= screen_y <= MARGIN + (BOARD_SIZE - 1) * CELL_SIZE:
-            c = round((screen_x - MARGIN) / CELL_SIZE)
-            r = round((screen_y - MARGIN) / CELL_SIZE)
-            if 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE:
-                return r, c
-        return None
+        """控件内坐标转棋盘格点；不在棋盘上则返回 None。
+
+        唯一实现在 ``BoardGeometry.to_grid``。历史上这里有第二份公式副本，
+        与 ``mouseMoveEvent`` 各自演化，是"悬停亮点与实际落点不一致"的来源。
+        """
+        return self.geom.to_grid(screen_x, screen_y)
 
 
 # ==================== 游戏面板（右侧） ====================
-class GamePanel(QWidget):
-    """右侧信息面板"""
+class GamePanel(QFrame):
+    """右侧信息面板。
+
+    继承 ``QFrame`` 而不是 ``QWidget``：QFrame 是 Qt 已知类，QSS 的
+    ``background`` 直接生效，不需要 ``WA_StyledBackground`` 那个补丁。
+    """
+
+    theme_clicked = pyqtSignal()
 
     def __init__(self):
         super().__init__()
-        self.setFixedWidth(260)
-        self.setStyleSheet(f"background-color: {COLOR_PANEL_BG.name()}; border-radius: 0 12px 12px 0;")
+        self.setProperty("role", "panel")
+        self.setFixedWidth(PANEL_W)
+        self._thinking = False
+        self._pulse_anim = None      # AI 思考的呼吸动画（须持有，否则被 GC）
+        self._elapsed = 0
+        # 图表序列（AI 视角的分值 + 点的来路）。**挂在面板上而不是
+        # GomokuGame 上**：面板每局新建，序列因此自动清零；挂到游戏对象上
+        # 会让新局接着显示上一局已经作废的历史。
+        self._series: list = []
+        self._decade = 2             # 评分图纵轴的数量级，只增不减
         self.setup_ui()
 
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._tick_timer)
+
     def setup_ui(self):
-        layout = QVBoxLayout()
-        layout.setContentsMargins(20, 30, 20, 30)
-        layout.setSpacing(15)
+        """节奏：内边距 XL(24)；四段之间 LG(16)；段内行距 SM(8)。
 
-        # 标题
-        title = QLabel("五子棋 AI")
-        title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet("""
-            QLabel {
-                color: #cdd6f4;
-                font-size: 22px;
-                font-weight: bold;
-                font-family: 'Microsoft YaHei', 'SimHei';
-            }
-        """)
+        ``GamePanel`` **不继承 ``Screen``**：Screen 是"居中、全屏、上下留白"，
+        面板是"贴边、定宽、四段式"，硬套会让两端都别扭。体系里共享 token 与
+        原语、不共享骨架 —— 两套排布，一套度量。
+        """
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(theme.SPACE_XL, theme.SPACE_XL,
+                                  theme.SPACE_XL, theme.SPACE_XL)
+        layout.setSpacing(theme.SPACE_LG)
 
-        # 分隔线
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet("background-color: #45475a; max-height: 1px;")
+        # 段 1：标题行（标题 + 主题切换）
+        head = QHBoxLayout()
+        head.setSpacing(theme.SPACE_SM)
+        head.addWidget(title_label("五子棋 AI", role="panel-title"),
+                       1, Qt.AlignVCenter)
+        self.theme_btn = button(self._theme_btn_text(), "ghost", height=32)
+        self.theme_btn.setFixedWidth(40)
+        self.theme_btn.setToolTip("切换深色 / 浅色主题")
+        self.theme_btn.clicked.connect(self.theme_clicked.emit)
+        head.addWidget(self.theme_btn, 0, Qt.AlignVCenter)
+        layout.addLayout(head)
 
-        # 当前回合
-        self.turn_label = QLabel("当前回合：黑棋 ●")
-        self.turn_label.setStyleSheet("color: #a6adc8; font-size: 14px; font-family: 'Microsoft YaHei';")
+        # 段 2：回合指示卡（面板里最醒目的一块）
+        self.turn_indicator = TurnIndicator()
+        layout.addWidget(self.turn_indicator)
 
-        # AI难度
-        self.difficulty_label = QLabel("AI 难度：-")
-        self.difficulty_label.setStyleSheet("color: #a6adc8; font-size: 14px; font-family: 'Microsoft YaHei';")
+        # 段 3：信息
+        info = QVBoxLayout()
+        info.setSpacing(theme.SPACE_SM)
+        self.difficulty_row = InfoRow("AI 难度", "—")
+        self.undo_row = InfoRow("悔棋次数", "3")
+        self.moves_row = InfoRow("步数", "0")
+        self.time_row = InfoRow("用时", "00:00")
+        for row in (self.difficulty_row, self.undo_row,
+                    self.moves_row, self.time_row):
+            info.addWidget(row)
+        layout.addLayout(info)
 
-        # 游戏状态
-        self.status_label = QLabel("游戏状态：进行中")
-        self.status_label.setStyleSheet("color: #a6e3a1; font-size: 14px; font-family: 'Microsoft YaHei';")
+        # 段 4：图表（原先这里是 addStretch(1) 的一块空白）
+        #
+        # 两张图共用 GamePanel._series 这一条序列，只是变换不同：上面是
+        # 原始分值（symlog 纵轴），下面是换算出的胜率（0–100% 纵轴）。
+        # 数据接线在 `GomokuGame._record_score`，**不在 _update_panel** ——
+        # 后者是渲染函数，每手会跑 2–3 次，在那里追点会重复。
+        self.score_chart = charts.ScoreChart()
+        self.win_chart = charts.WinRateChart()
+        for chart in (self.score_chart, self.win_chart):
+            chart.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+            layout.addWidget(chart, 1)
 
-        # AI思考指示器
-        self.thinking_label = QLabel("")
-        self.thinking_label.setAlignment(Qt.AlignCenter)
-        self.thinking_label.setStyleSheet("color: #89b4fa; font-size: 13px; font-family: 'Consolas';")
-        self.thinking_label.hide()
+        # 段 5：操作
+        self.undo_btn = button("↩ 悔棋", "ghost")
+        self.restart_btn = button("🔄 重新开始", "primary")
+        self.quit_btn = button("✕ 退出游戏", "danger")
+        for btn in (self.undo_btn, self.restart_btn, self.quit_btn):
+            layout.addWidget(btn)
 
-        # 剩余悔棋次数
-        self.undo_label = QLabel("悔棋次数：3")
-        self.undo_label.setStyleSheet("color: #a6adc8; font-size: 14px; font-family: 'Microsoft YaHei';")
+    @staticmethod
+    def _theme_btn_text() -> str:
+        """图标指向"点一下会变成的样子"：深色中显示太阳，浅色中显示月亮。"""
+        return "🌙" if theme.current_theme() == "light" else "☀"
 
-        # 分隔线2
-        sep2 = QFrame()
-        sep2.setFrameShape(QFrame.HLine)
-        sep2.setStyleSheet("background-color: #45475a; max-height: 1px;")
+    def update_theme_button(self) -> None:
+        self.theme_btn.setText(self._theme_btn_text())
+        # 图表是自绘的，颜色在 paint 时取 theme.*，所以主题切换后必须重画
+        # 一次 —— QSS 的 repolish 管不到 QPainter。
+        for chart in (self.score_chart, self.win_chart):
+            chart.update()
 
-        # 统计
-        self.stats_label = QLabel("步数：0")
-        self.stats_label.setStyleSheet("color: #6c7086; font-size: 12px; font-family: 'Consolas';")
+    # ---- 图表序列 ----
+    #
+    # 两条约束，都只在这里成立一次：
+    #   1. 序列与 `GomokuGame.move_history` **严格同长** —— 悔棋靠 truncate 同步。
+    #   2. 数量级只增不减 —— 否则轴会随分值回落而收缩，同一条曲线在下一手看
+    #      起来会突然"变陡"，而那是轴在动、不是棋在动。
 
-        # 按钮区域
-        btn_layout = QVBoxLayout()
-        btn_layout.setSpacing(10)
+    def push_score(self, value: float, kind: str) -> None:
+        """追一个点。``kind`` 见 ``charts.SEARCH`` / ``charts.STATIC``。"""
+        value = float(value)
+        self._series.append((value, kind))
+        self._decade = max(self._decade, analysis.needed_decade(value))
+        self._refresh_charts()
 
-        self.undo_btn = self._make_button("↩ 悔棋", COLOR_ACCENT, "#74c7ec")
-        self.restart_btn = self._make_button("🔄 重新开始", COLOR_GREEN, "#94e2d5")
-        self.quit_btn = self._make_button("✕ 退出游戏", COLOR_RED, "#eba0ac")
+    def truncate_series(self, n: int) -> None:
+        """把序列截回 ``n`` 个点（悔棋）。**不缩数量级** —— 见上面第 2 条。"""
+        del self._series[n:]
+        self._refresh_charts()
 
-        btn_layout.addWidget(self.undo_btn)
-        btn_layout.addWidget(self.restart_btn)
-        btn_layout.addWidget(self.quit_btn)
+    def set_readout(self, text: str) -> None:
+        """搜索参数读数（评分卡的第三行）。"""
+        self.score_chart.set_readout(text)
 
-        layout.addWidget(title)
-        layout.addWidget(sep)
-        layout.addWidget(self.turn_label)
-        layout.addWidget(self.difficulty_label)
-        layout.addWidget(self.status_label)
-        layout.addWidget(self.undo_label)
-        layout.addWidget(self.thinking_label)
-        layout.addWidget(sep2)
-        layout.addWidget(self.stats_label)
-        layout.addStretch()
-        layout.addLayout(btn_layout)
+    def _refresh_charts(self) -> None:
+        self.score_chart.set_decade(self._decade)
+        self.score_chart.set_series(self._series)
+        self.win_chart.set_series(self._series)
 
-        self.setLayout(layout)
+    # ---- 状态更新 ----
 
-    def _make_button(self, text, color, hover_color):
-        btn = QPushButton(text)
-        btn.setCursor(Qt.PointingHandCursor)
-        btn.setFixedHeight(40)
-        btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {color.name()};
-                color: #1e1e2e;
-                border: none;
-                border-radius: 8px;
-                font-size: 14px;
-                font-weight: bold;
-                font-family: 'Microsoft YaHei';
-            }}
-            QPushButton:hover {{
-                background-color: {hover_color};
-            }}
-            QPushButton:pressed {{
-                background-color: {color.darker(120).name()};
-            }}
-        """)
-        return btn
-
-    def update_info(self, turn, difficulty, status, undo_count, move_count):
+    def update_info(self, turn, difficulty, status, undo_count, move_count,
+                    human=1):
         players = {1: "黑棋 ●", 2: "白棋 ○"}
-        turn_text = f"当前回合：{players.get(turn, '-')}"
-        self.turn_label.setText(turn_text)
-        self.difficulty_label.setText(f"AI 难度：{difficulty} 级")
-        self.status_label.setText(f"游戏状态：{status}")
-        self.undo_label.setText(f"悔棋次数：{undo_count}")
-        self.stats_label.setText(f"步数：{move_count}")
-
-        if status == "你赢了！":
-            self.status_label.setStyleSheet("color: #a6e3a1; font-size: 14px; font-weight: bold;")
-        elif status == "你输了！":
-            self.status_label.setStyleSheet("color: #f38ba8; font-size: 14px; font-weight: bold;")
+        self.difficulty_row.set_value(f"{difficulty} 级")
+        self.undo_row.set_value(str(undo_count))
+        self.moves_row.set_value(str(move_count))
+        if status == "进行中":
+            if not self._thinking:
+                if turn == human:
+                    self.turn_indicator.set_turn(turn, "轮到你落子")
+                else:
+                    self.turn_indicator.set_turn(turn,
+                                                 f"{players[turn]} 行动中")
         else:
-            self.status_label.setStyleSheet("color: #a6adc8; font-size: 14px;")
+            tone = {"你赢了！": "win", "你输了！": "lose"}.get(status, "")
+            stone = human if tone == "win" else (3 - human)
+            self.turn_indicator.set_result(stone, status, tone)
+            self.stop_timer()        # 终局停表
 
-    def show_thinking(self, show=True):
+    def show_thinking(self, show=True, ai_stone=2):
+        """AI 思考态：指示卡转蓝 + 呼吸动画。"""
+        self._thinking = show
         if show:
-            self.thinking_label.setText("AI 思考中...")
-            self.thinking_label.show()
+            self.turn_indicator.set_thinking(ai_stone)
+            if self._pulse_anim is None:
+                self._pulse_anim = anim.pulse(self.turn_indicator)
         else:
-            self.thinking_label.hide()
+            if self._pulse_anim is not None:
+                anim.stop_pulse(self.turn_indicator)
+                self._pulse_anim = None
+
+    # ---- 计时器 ----
+
+    def reset_timer(self):
+        self._elapsed = 0
+        self.time_row.set_value("00:00")
+        self._timer.start()
+
+    def stop_timer(self):
+        self._timer.stop()
+
+    def _tick_timer(self):
+        self._elapsed += 1
+        m, s = divmod(self._elapsed, 60)
+        self.time_row.set_value(f"{m:02d}:{s:02d}")
 
 
 # ==================== 选择界面 ====================
-class SelectionScreen(QWidget):
-    """执棋颜色 / AI难度选择"""
+class SelectionScreen(Screen):
+    """执棋颜色 / AI难度选择。
+
+    两个模式共用 ``Screen`` 的骨架与节奏，差异只剩标题文案与卡片行 —— 历史上
+    两条分支各自抄了一份 stretch/spacing（一个 30 一个 25，没有理由）。
+    """
 
     color_selected = pyqtSignal(int)  # 0=黑先, 1=白后
     difficulty_selected = pyqtSignal(int)  # 1-3
 
     def __init__(self, mode="color"):
-        super().__init__()
         self.mode = mode
+        self._cards = []
+        if mode == "color":
+            super().__init__(title="选择执棋颜色",
+                             subtitle="黑棋为先手，白棋为后手",
+                             backdrop=True)
+        else:
+            super().__init__(title="选择 AI 难度",
+                             subtitle="难度越高，AI 思考越深入",
+                             backdrop=True)
         self.setup_ui()
 
     def setup_ui(self):
-        self.setStyleSheet("background: transparent;")
-
-        layout = QVBoxLayout()
-        layout.setAlignment(Qt.AlignCenter)
-
         if self.mode == "color":
-            title = QLabel("选择执棋颜色")
-            title.setStyleSheet("color: #cdd6f4; font-size: 28px; font-weight: bold; font-family: 'Microsoft YaHei';")
-            title.setAlignment(Qt.AlignCenter)
-
-            hint = QLabel("黑棋为先手，白棋为后手")
-            hint.setStyleSheet("color: #6c7086; font-size: 14px; font-family: 'Microsoft YaHei';")
-            hint.setAlignment(Qt.AlignCenter)
-
-            btn_layout = QHBoxLayout()
-            btn_layout.setSpacing(30)
-
-            black_btn = self._make_card_btn("⚫\n黑棋（先手）", QColor("#1a1a1a"), QColor("#333333"))
-            white_btn = self._make_card_btn("⚪\n白棋（后手）", QColor("#f0f0f0"), QColor("#ffffff"),
-                                             text_color=QColor("#1e1e2e"))
-
-            black_btn.clicked.connect(lambda: self.color_selected.emit(0))
-            white_btn.clicked.connect(lambda: self.color_selected.emit(1))
-
-            btn_layout.addWidget(black_btn)
-            btn_layout.addWidget(white_btn)
-
-            layout.addStretch(2)
-            layout.addWidget(title)
-            layout.addSpacing(10)
-            layout.addWidget(hint)
-            layout.addSpacing(40)
-            layout.addLayout(btn_layout)
-            layout.addStretch(3)
-
-        else:  # difficulty
-            title = QLabel("选择 AI 难度")
-            title.setStyleSheet("color: #cdd6f4; font-size: 28px; font-weight: bold; font-family: 'Microsoft YaHei';")
-            title.setAlignment(Qt.AlignCenter)
-
-            hint = QLabel("难度越高，AI思考越深入")
-            hint.setStyleSheet("color: #6c7086; font-size: 14px; font-family: 'Microsoft YaHei';")
-            hint.setAlignment(Qt.AlignCenter)
-
-            btn_layout = QHBoxLayout()
-            btn_layout.setSpacing(25)
-
-            colors = [COLOR_GREEN, COLOR_ACCENT, COLOR_RED]
-            hovers = ["#94e2d5", "#74c7ec", "#eba0ac"]
-            labels = ["初级\n搜索深度 1", "中级\n搜索深度 2", "高级\n搜索深度 3"]
-
-            for i in range(3):
-                btn = self._make_card_btn(labels[i], colors[i], hovers[i], text_color=QColor("#1e1e2e"))
+            # 卡面直接放那颗子本身（黑 = player 1），不再用 ⚫/⚪ 字符 ——
+            # 那两个字符由 CJK 字体回退渲染成一个小圆点，既不是棋子也不是
+            # 那个颜色，是这张卡片最关键的区分信息却最看不清的地方。
+            cards = [("黑棋", "black", 0, 1, "先手"),
+                     ("白棋", "white", 1, 2, "后手")]
+            for i, (text, tone, value, player, sub) in enumerate(cards):
+                btn = card_button(text, tone, face=StoneFace(player), sub=sub,
+                                  index=f"{i + 1:02d}")
+                btn.clicked.connect(lambda _=False, v=value:
+                                    self.color_selected.emit(v))
+                self._cards.append(btn)
+        else:
+            # 副标题**曾经写的是"搜索深度 1/2/3"**，那是假的：三个档位的搜索
+            # 深度上限是 4/10/24，实测到的是 4/4/5（见 tools/BASELINE.md）。
+            # 改报思考时限 —— 它是 engine.DIFFICULTY 里真实存在、且用户能直接
+            # 感知的量（"AI 要想多久"）。
+            for i, (text, tone, secs) in enumerate(
+                    (("初级", "success", "3"), ("中级", "primary", "5"),
+                     ("高级", "danger", "15"))):
+                # 1/2/3 颗子当强度条 —— 用的是棋盘上那套材质，不是另画一个图标。
+                btn = card_button(text, tone,
+                                  face=stone_row([1] * (i + 1)),
+                                  sub=f"思考上限 {secs} 秒",
+                                  index=f"{i + 1:02d}")
                 level = i + 1
-                btn.clicked.connect(lambda checked, l=level: self.difficulty_selected.emit(l))
-                btn_layout.addWidget(btn)
+                btn.clicked.connect(lambda _=False, l=level:
+                                    self.difficulty_selected.emit(l))
+                self._cards.append(btn)
 
-            layout.addStretch(2)
-            layout.addWidget(title)
-            layout.addSpacing(10)
-            layout.addWidget(hint)
-            layout.addSpacing(40)
-            layout.addLayout(btn_layout)
-            layout.addStretch(3)
-
-        self.setLayout(layout)
-
-    def _make_card_btn(self, text, color, hover_color, text_color=QColor("#cdd6f4")):
-        btn = QPushButton(text)
-        btn.setCursor(Qt.PointingHandCursor)
-        btn.setFixedSize(160, 160)
-        btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {color.name()};
-                color: {text_color.name()};
-                border: 3px solid transparent;
-                border-radius: 16px;
-                font-size: 18px;
-                font-weight: bold;
-                font-family: 'Microsoft YaHei';
-            }}
-            QPushButton:hover {{
-                background-color: {hover_color};
-                border: 3px solid #cdd6f4;
-            }}
-        """)
-        return btn
+        self.add_content(hbox(*self._cards, spacing=theme.SPACE_XL))
 
 
 # ==================== 游戏结束覆盖层 ====================
-class GameOverOverlay(QWidget):
-    """游戏结束遮罩"""
+class GameOverOverlay(Screen):
+    """游戏结束遮罩。
+
+    继承 ``Screen`` 并把 ``objectName`` 换成 ``overlayRoot`` —— 半透明底由
+    ``theme`` 的 ``QWidget#overlayRoot`` 规则给。
+
+    **不要再 setStyleSheet 上色。** 旧的 ``setStyleSheet("background: rgba(...)")``
+    没有选择器，Qt 会把它传播给全部子控件，于是"结果文字"和两个按钮各自被刷成
+    一块深色圆角方块，而遮罩本身反而不铺满。这就是窗口级样式表的同一个陷阱。
+    """
 
     restart_clicked = pyqtSignal()
     quit_clicked = pyqtSignal()
 
     def __init__(self, result_text, is_win):
-        super().__init__()
+        super().__init__(root_name="overlayRoot")
         self.result_text = result_text
         self.is_win = is_win
-        self.setStyleSheet("background: rgba(0, 0, 0, 160); border-radius: 12px;")
         self.setup_ui()
 
     def setup_ui(self):
-        layout = QVBoxLayout()
-        layout.setAlignment(Qt.AlignCenter)
+        result = title_label(self.result_text)
+        result.setProperty("tone", "win" if self.is_win else "lose")
+        self.add_content(result)
 
-        # 结果文字
-        result_label = QLabel(self.result_text)
-        result_label.setAlignment(Qt.AlignCenter)
-        color = "#a6e3a1" if self.is_win else "#f38ba8"
-        result_label.setStyleSheet(f"""
-            QLabel {{
-                color: {color};
-                font-size: 42px;
-                font-weight: bold;
-                font-family: 'Microsoft YaHei';
-            }}
-        """)
-
-        # 按钮
-        btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(20)
-
-        restart_btn = QPushButton("🔄 再来一局")
-        restart_btn.setCursor(Qt.PointingHandCursor)
-        restart_btn.setFixedSize(150, 45)
-        restart_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #a6e3a1;
-                color: #1e1e2e;
-                border: none;
-                border-radius: 10px;
-                font-size: 16px;
-                font-weight: bold;
-                font-family: 'Microsoft YaHei';
-            }
-            QPushButton:hover { background-color: #94e2d5; }
-        """)
+        restart_btn = button("🔄 再来一局", "success", width=150)
         restart_btn.clicked.connect(self.restart_clicked.emit)
-
-        quit_btn = QPushButton("✕ 退出游戏")
-        quit_btn.setCursor(Qt.PointingHandCursor)
-        quit_btn.setFixedSize(150, 45)
-        quit_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #f38ba8;
-                color: #1e1e2e;
-                border: none;
-                border-radius: 10px;
-                font-size: 16px;
-                font-weight: bold;
-                font-family: 'Microsoft YaHei';
-            }
-            QPushButton:hover { background-color: #eba0ac; }
-        """)
+        quit_btn = button("✕ 退出游戏", "danger", width=150)
         quit_btn.clicked.connect(self.quit_clicked.emit)
-
-        btn_layout.addWidget(restart_btn)
-        btn_layout.addWidget(quit_btn)
-
-        layout.addStretch(2)
-        layout.addWidget(result_label)
-        layout.addSpacing(30)
-        layout.addLayout(btn_layout)
-        layout.addStretch(2)
-
-        self.setLayout(layout)
+        self.add_content(hbox(restart_btn, quit_btn, spacing=theme.SPACE_LG))
 
 
 # ==================== 主窗口 ====================
 class GomokuGame(QMainWindow):
     """主游戏窗口"""
 
+    @staticmethod
+    def _initial_size() -> tuple:
+        """按屏幕可用区算初始尺寸。
+
+        **不要写回 setFixedSize。** 1366×768 这类屏幕上设计尺寸 WINDOW_W×WINDOW_H
+        连标题栏一起是摆不下的，定死会让窗口底部（退出按钮）掉到屏幕外，而且
+        用户无法挽救 —— 窗口既不能缩也不能拉。
+
+        上限取 ``MAX_SCALE``：4K 屏上按可用区铺满的话棋盘大到需要转头看，而
+        棋盘的可用性上限来自"一眼能看全 19 路"。**不设下限** —— 那由
+        ``setMinimumSize`` 负责，两处各管一头。
+        """
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return (WINDOW_W, WINDOW_H)
+        avail = screen.availableGeometry()
+        # 留 8% 余量，避免贴着屏幕边缘（任务栏、窗口阴影、部分 WM 的吸附区）。
+        k = min(MAX_SCALE,
+                (avail.width() * 0.92) / WINDOW_W,
+                (avail.height() * 0.92) / WINDOW_H)
+        k = max(k, 1.0)
+        return (int(WINDOW_W * k), int(WINDOW_H * k))
+
+    def _center_on_screen(self):
+        """把窗口摆到所在屏幕可用区中央。"""
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        frame = self.frameGeometry()
+        frame.moveCenter(screen.availableGeometry().center())
+        self.move(frame.topLeft())
+
+    def showEvent(self, event):
+        """首次显示时居中。
+
+        放在 showEvent 而不是 ``__init__``：``frameGeometry()`` 在窗口还没被
+        窗口管理器加上标题栏／边框之前是不可信的，构造期算出来的中心会偏。
+        """
+        super().showEvent(event)
+        if not self._centered:
+            self._centered = True
+            self._center_on_screen()
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("五子棋 AI · PyTorch Engine")
-        self.setFixedSize(WINDOW_W, WINDOW_H)
-        self.setStyleSheet(f"background-color: {COLOR_BG.name()};")
+        # 全局 QSS 必须早于任何 widget 构造。放在这里而不是 main()：
+        # gui_smoke 自建 QApplication 后直接构造本窗口、不走 main()，
+        # 装在这儿离屏冒烟才会真的执行这套样式。
+        theme.install()
+
+        self.setWindowTitle("五子棋 AI")
+        self.setMinimumSize(MIN_W, MIN_H)
+        self.resize(*self._initial_size())
+        self._centered = False      # 只在首次 show 时居中一次
+        # 这里**不要**再写 setStyleSheet("background-color: ...")。Qt 会把
+        # 控件级样式表传播给全部子控件，且优先级高于应用级 —— 一条无选择器的
+        # 背景色会把进度条的槽、面板底色一起刷掉（实测槽色直接消失）。
+        # 窗口底色由 theme 的 QMainWindow 规则统一给。
 
         # 游戏状态变量
         self.board = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=int)
@@ -2641,6 +786,7 @@ class GomokuGame(QMainWindow):
 
         # AI Worker
         self.ai_worker = None
+        self._ai_generation = 0     # 每次发起搜索递增，用于丢弃陈旧结果
 
         # 游戏日志
         self.logger = None
@@ -2667,15 +813,60 @@ class GomokuGame(QMainWindow):
         self.central.setCurrentWidget(self.loading_screen)
 
     def _on_loading_finished(self):
-        """加载完成，进入主菜单"""
+        """加载完成，进入主菜单。
+
+        开场只有 900ms，用户（或冒烟测试）可能已经抢先切走了 —— 那样这个
+        迟到的回调会把界面**拽回**颜色选择页。所以在推进前先确认加载页仍是
+        当前页；`central.currentWidget()` 在页面被删后为 None，也一并挡住。
+        """
+        if self.central.currentWidget() is not self.loading_screen:
+            return
         self._show_color_selection()
+
+    def _drop_pages(self):
+        """切页时回收旧页面。
+
+        旧代码每个 ``_show_*`` 都是 ``central.addWidget(...)`` 却从不移除 ——
+        每重开一局就多留一整棵 widget 树（棋盘连同它的两层 pixmap 缓存）在
+        ``QStackedWidget`` 里，永远不会被回收。
+
+        **置空引用和 deleteLater 同样重要。** ``deleteLater`` 只是排队删除，
+        C++ 对象随即失效；若 ``self.board_widget`` 仍指向它，之后任何访问都会
+        抛 ``RuntimeError: wrapped C/C++ object has been deleted``，而它通常
+        发生在 Qt 槽里 —— 直接崩。
+
+        调用方必须**先** ``_cancel_ai()``：AI 线程的结果回调会碰棋盘状态，
+        在已删除的 widget 上写日志会抛 ValueError。
+        """
+        for attr in ("loading_screen", "selection_color",
+                     "selection_difficulty", "game_widget"):
+            page = getattr(self, attr, None)
+            if page is not None:
+                self.central.removeWidget(page)
+                page.deleteLater()
+        # board_widget / game_panel / overlay 是 game_widget 的子控件，
+        # 随父一起销毁，不需要（也不能）单独 removeWidget。
+        for attr in ("loading_screen", "selection_color", "selection_difficulty",
+                     "game_widget", "board_widget", "game_panel",
+                     "game_over_overlay", "_stack"):
+            setattr(self, attr, None)
+
+    def _switch_page(self, page):
+        """统一收口的切页：入栈 + 置当前 + 180ms 淡入。
+
+        加载页→颜色页→难度页→游戏页共 4 处切换点，全部走这里 —— "切页有
+        过渡"是结构保证的，不是逐处手抄出来的。
+        """
+        self.central.addWidget(page)
+        self.central.setCurrentWidget(page)
+        anim.fade_in(page)
 
     def _show_color_selection(self):
         """显示执棋颜色选择"""
+        self._drop_pages()
         self.selection_color = SelectionScreen(mode="color")
         self.selection_color.color_selected.connect(self._on_color_selected)
-        self.central.addWidget(self.selection_color)
-        self.central.setCurrentWidget(self.selection_color)
+        self._switch_page(self.selection_color)
 
     def _on_color_selected(self, mode):
         """选择了执棋颜色"""
@@ -2686,8 +877,7 @@ class GomokuGame(QMainWindow):
         """显示难度选择"""
         self.selection_difficulty = SelectionScreen(mode="difficulty")
         self.selection_difficulty.difficulty_selected.connect(self._on_difficulty_selected)
-        self.central.addWidget(self.selection_difficulty)
-        self.central.setCurrentWidget(self.selection_difficulty)
+        self._switch_page(self.selection_difficulty)
 
     def _on_difficulty_selected(self, level):
         """选择了难度，开始游戏"""
@@ -2715,63 +905,83 @@ class GomokuGame(QMainWindow):
         self.ai_first_move_done = False
         self.last_move = None
 
-        # 清空全局状态
-        global _killer_moves, _history_table, _transposition_table, _eval_cache, _tt_age
-        _killer_moves = [[None, None] for _ in range(MAX_DEPTH)]
-        _history_table = np.zeros((2, BOARD_SIZE, BOARD_SIZE), dtype=np.int32)
-        _transposition_table = [None] * TT_SIZE
-        _eval_cache = {}
-        _tt_age = 0
+        # 清空引擎的跨局面状态（置换表 / history / killer）。
+        # 原版在这里重建 main.py 的模块级全局；引擎改为提供显式入口，
+        # 状态不再散落在模块级别。
+        new_game()
+        # 代数只增不减：重置回 0 反而危险 —— 上一局某个"迟到"的结果可能正好
+        # 持有重置后才会出现的编号，于是被当成当前局的合法结果放行。
+        self._ai_generation += 1     # 新局作废上一局的一切在途结果
 
         # 构建游戏界面
         self._build_game_ui()
 
     def _build_game_ui(self):
-        """构建游戏主界面"""
-        game_container = QWidget()
-        game_container.setStyleSheet("background: transparent;")
-        h_layout = QHBoxLayout()
-        h_layout.setContentsMargins(0, 0, 0, 0)
-        h_layout.setSpacing(0)
+        """构建游戏主界面。
 
-        # 棋盘
+        节奏：``GAP | 棋盘 | SPACE_SM | 面板 | GAP``，纵向 ``GAP | 棋盘 | GAP``。
+        于是棋盘在窗口里正好是 ``BOARD_PX`` 见方（设计基准 1:1），不再需要给
+        ``BoardWidget`` 写死尺寸 —— 缩放交给 ``BoardGeometry.fit()``。
+
+        刻意**没有**棋盘外面的包装容器（旧代码有一层刷成木色的
+        ``board_wrapper``，给棋盘做左侧圆角）：木盘自己就是圆角的，外面再套一
+        层等大的木色只会把圆角外的深色三角填满，看起来是个方正的橙块。
+        """
+        self.game_widget = QWidget()
+        self.game_widget.setObjectName("screenRoot")
+        self.game_widget.setAttribute(Qt.WA_StyledBackground, True)
+
         self.board_widget = BoardWidget()
         self.board_widget.set_board(self.board)
         self.board_widget.mousePressEvent = self._on_board_click
 
-        # 包装棋盘（左侧圆角）
-        board_wrapper = QWidget()
-        board_wrapper.setStyleSheet("""
-            background-color: #dcb35c;
-            border-radius: 12px 0 0 12px;
-        """)
-        board_layout = QVBoxLayout()
-        board_layout.setContentsMargins(0, 0, 0, 0)
-        board_layout.addWidget(self.board_widget)
-        board_wrapper.setLayout(board_layout)
-
-        # 右侧面板
         self.game_panel = GamePanel()
         self.game_panel.undo_btn.clicked.connect(self._on_undo)
         self.game_panel.restart_btn.clicked.connect(self._on_restart)
         self.game_panel.quit_btn.clicked.connect(self._on_quit)
+        self.game_panel.theme_clicked.connect(self._on_toggle_theme)
+        self.game_panel.reset_timer()
 
-        h_layout.addWidget(board_wrapper)
-        h_layout.addWidget(self.game_panel)
+        # 纯容器，**不要**给它 setStyleSheet：Qt 会把控件级样式表传播给全部
+        # 子控件，一条无选择器的 background 会把面板底色、按钮底色全刷掉。
+        # 裸 QWidget 本来就不画背景，什么都不用设。
+        #
+        # 窗口边距放在这个布局上，**不要指望 QStackedLayout 的
+        # setContentsMargins**：实测它被忽略，子控件拿到的是控件全尺寸
+        # （棋盘因此变成 750x750、k=1.033，不再是设计基准 1:1）。
+        game_row = QWidget()
+        row = QHBoxLayout(game_row)
+        row.setContentsMargins(GAP, GAP, GAP, GAP)
+        row.setSpacing(theme.SPACE_SM)
+        row.addWidget(self.board_widget, 1)
+        row.addWidget(self.game_panel, 0)
 
-        game_container.setLayout(h_layout)
+        # 高度下限按**面板的实测最小值**兜底，不能用模块常量 MIN_H：
+        # 那个数依赖字体度量（刻度文字、读数行的高度）与平台控件尺寸，
+        # 只有 QApplication 起来之后才量得准。这里量出来比 MIN_H 高就抬上去 ——
+        # 抬不上去的后果是面板被挤，图表压成一条缝，而它不会报错。
+        need_h = 2 * GAP + self.game_panel.minimumSizeHint().height()
+        # 上限取设计高度 WINDOW_H：窗口最小高度一旦超过设计尺寸，小屏上的
+        # `_initial_size()` 就压不下去（最小尺寸优先于它），窗口会连标题栏
+        # 一起顶出屏幕。宁可面板挤一点，也不能让窗口装不下。
+        need_h = min(need_h, WINDOW_H)
+        if need_h > self.minimumHeight():
+            self.setMinimumHeight(need_h)
 
-        # 游戏结束覆盖层（初始隐藏）
+        # 结算遮罩叠在同一块区域上。
+        #
+        # 旧代码把遮罩 addWidget 进一个 QVBoxLayout 后又 setGeometry(rect()) ——
+        # 那是在和布局打架。它没露馅只是因为棋盘当时 setFixedSize 撑着容器最小
+        # 高度，遮罩只能拿到 0 高度。棋盘一旦可缩放，容器最小高度塌陷，遮罩就
+        # 会把棋盘挤成一半。QStackedLayout(StackAll) 让两者共用同一块几何，
+        # 尺寸完全交给布局托管。
         self.game_over_overlay = None
+        self._stack = QStackedLayout(self.game_widget)
+        self._stack.setContentsMargins(0, 0, 0, 0)
+        self._stack.setStackingMode(QStackedLayout.StackAll)
+        self._stack.addWidget(game_row)
 
-        self.game_widget = QWidget()
-        overlay_layout = QVBoxLayout()
-        overlay_layout.setContentsMargins(0, 0, 0, 0)
-        overlay_layout.addWidget(game_container)
-        self.game_widget.setLayout(overlay_layout)
-
-        self.central.addWidget(self.game_widget)
-        self.central.setCurrentWidget(self.game_widget)
+        self._switch_page(self.game_widget)
 
         self._update_panel()
 
@@ -2779,19 +989,34 @@ class GomokuGame(QMainWindow):
         if self.gamemode == 1:  # 玩家后手，AI先手
             self._ai_first_move()
 
+    def _on_toggle_theme(self):
+        """面板上的主题切换：换调色板 → QSS 重装 → 按钮图标翻转。
+
+        棋盘色两套主题共享，board_render 的纹理/sprite/静态层缓存**不需要**
+        作废 —— 切换是纯 QSS 操作，不会闪烁或卡顿。
+        """
+        theme.toggle_theme()
+        self.game_panel.update_theme_button()
+
     def _ai_first_move(self):
-        """AI第一步：下天元"""
+        """AI先手的第一着，由 engine.opening_move 决定（确定性，无随机）。"""
         if not self.ai_first_move_done:
             self.ai_first_move_done = True
-            self.board[9][9] = 1
-            self.last_move = (9, 9, 1)
+            mv = opening_move(self.board, 1)
+            if mv is None:                      # 理论上不会发生
+                mv = (BOARD_SIZE // 2, BOARD_SIZE // 2)
+            r, c = mv
+            self.board[r][c] = 1
+            self.last_move = (r, c, 1)
             self.board_widget.set_board(self.board)
-            self.board_widget.set_last_move(9, 9, 1)
+            self.board_widget.set_last_move(r, c, 1)
             self.move_count += 1
             self.move_history.append(self.board.copy())
+            self._record_score(None)
             if self.logger:
-                self.logger.log_ai(self.move_count, 1, 9, 9,
-                    {'reason': 'AI先手-天元', 'detail': 'J10'})
+                self.logger.log_ai(self.move_count, 1, r, c,
+                    {'reason': 'AI先手-开局着法',
+                     'detail': GameLogger.coord_to_sgf(r, c)})
             self._update_panel()
 
     def _on_board_click(self, event: QMouseEvent):
@@ -2821,6 +1046,7 @@ class GomokuGame(QMainWindow):
         self.board_widget.set_last_move(r, c, player_stone)
         self.move_count += 1
         self.move_history.append(self.board.copy())
+        self._record_score(None)
         if self.logger:
             self.logger.log_human(self.move_count, player_stone, r, c)
             # 每隔约5步记录一次完整棋盘状态
@@ -2832,6 +1058,8 @@ class GomokuGame(QMainWindow):
         if check_win(self.board, player_stone):
             self.gamerule = 2
             self.game_over = True
+            self.board_widget.set_win_cells(
+                win_line(self.board, player_stone), player_stone)
             self._show_game_over()
             return
 
@@ -2848,15 +1076,31 @@ class GomokuGame(QMainWindow):
     def _ai_turn(self, ai_stone):
         """AI回合"""
         self.ai_thinking = True
-        self.game_panel.show_thinking(True)
+        self.game_panel.show_thinking(True, ai_stone)
         self.game_panel.undo_btn.setEnabled(False)
 
+        self._ai_generation += 1
+        gen = self._ai_generation
         self.ai_worker = AIWorker(self.board, ai_stone, self.gamekunnan)
-        self.ai_worker.finished.connect(self._on_ai_finished)
+        self.ai_worker.finished.connect(
+            lambda r, c, info, g=gen: self._on_ai_finished(r, c, info, g))
         self.ai_worker.start()
 
-    def _on_ai_finished(self, r, c, info=None):
-        """AI落子完成"""
+    def _on_ai_finished(self, r, c, info=None, generation=None):
+        """AI落子完成。
+
+        generation 校验：重开局或悔棋会让上一局的 worker 结果"迟到"到达，
+        不丢弃的话就会把旧局的棋子落到新棋盘上。
+        """
+        if generation is not None and generation != self._ai_generation:
+            return          # 陈旧结果，丢弃
+        if r < 0 or c < 0:
+            # 引擎返回了错误哨兵
+            self.ai_thinking = False
+            self.game_panel.show_thinking(False)
+            self.game_panel.undo_btn.setEnabled(True)
+            print(f"[AI异常] {(info or {}).get('detail', '')}")
+            return
         self.ai_thinking = False
         self.game_panel.show_thinking(False)
         self.game_panel.undo_btn.setEnabled(True)
@@ -2872,9 +1116,13 @@ class GomokuGame(QMainWindow):
         self.board_widget.set_last_move(r, c, ai_stone)
         self.move_count += 1
         self.move_history.append(self.board.copy())
+        self._record_score(info)
 
-        # 记录AI决策日志
-        if self.logger:
+        # 记录AI决策日志。
+        # 额外判一次 f.closed 是纵深防御：代数校验已经保证陈旧结果到不了这里，
+        # 但真到了的话，往已关闭文件写会抛 ValueError —— 异常在 Qt 槽里传播
+        # 会直接让整个程序崩溃。宁可少写一行日志，也不能崩掉用户的对局。
+        if self.logger and not self.logger.f.closed:
             if info is None:
                 info = {'reason': '未知'}
             self.logger.log_ai(self.move_count, ai_stone, r, c, info)
@@ -2889,6 +1137,8 @@ class GomokuGame(QMainWindow):
         if check_win(self.board, ai_stone):
             self.gamerule = 1
             self.game_over = True
+            self.board_widget.set_win_cells(
+                win_line(self.board, ai_stone), ai_stone)
             self._show_game_over()
             return
 
@@ -2897,6 +1147,47 @@ class GomokuGame(QMainWindow):
             self.gamerule = 0
             self.game_over = True
             self._show_game_over()
+
+    def _record_score(self, info=None):
+        """把一个分值挂进面板的两张图。**三个 `move_history.append` 各调一次。**
+
+        为什么不放进 ``_update_panel``：那是渲染函数，每手会跑 2–3 次
+        （``_build_game_ui`` 在第一手之前、``_show_game_over`` 在获胜之后还会
+        再来一次），在那里追点会产生幽灵点和重复点。
+
+        取值分两条路，**图上用两种点区分**（见 ``charts``）：
+
+        * 有可用的搜索结果 → ``info['best_val']``（AI 视角；杀棋分带内是
+          搜索**证明**的，不是估计的）
+        * 否则 → ``-evaluate(board, human)`` 的静态估值（无深度、无轮次概念）
+
+        判定必须防御性：``info`` 有三个产出点且字段不全（空盘分支只有
+        ``depth=0, best_val=0``），搜索也可能在 depth 1 之前就被 VCF 吃光预算。
+        """
+        best = None if info is None else info.get("best_val")
+        # `or is_mate(best)` 不是装饰：VCF 已证明必胜、主循环在 depth 1 之前被
+        # 取消时 best_val **就是**已证明的杀棋分而 depth == 0，丢掉它等于扔掉
+        # 全局最强的证据。
+        if best is not None and (info.get("depth", 0) > 0 or is_mate(best)):
+            self.game_panel.push_score(best, charts.SEARCH)
+            self.game_panel.set_readout(analysis.readout_line(info))
+        else:
+            # 求 player 视角再取负 = AI 视角（evaluate 严格零和，见 test_eval）。
+            player = 1 if self.gamemode == 0 else 2
+            static = -evaluate(Board.from_array(self.board), player)
+            self.game_panel.push_score(static, charts.STATIC)
+            self.game_panel.set_readout("")
+
+    def _rewind(self, n: int) -> None:
+        """弹出 ``n`` 步并让图表序列跟着退。
+
+        "序列与 ``move_history`` 严格同长"这条不变量**只在这里**定义一次 ——
+        三个悔棋分支各写一遍 `truncate_series` 迟早会漏掉一个。
+        """
+        for _ in range(n):
+            if self.move_history:
+                self.move_history.pop()
+        self.game_panel.truncate_series(len(self.move_history))
 
     def _on_undo(self):
         """悔棋：撤回玩家最后一步及其后的AI回应（共2步）"""
@@ -2911,22 +1202,22 @@ class GomokuGame(QMainWindow):
 
         if self.move_count >= 2:
             # 弹出最后两步（玩家 + AI）
-            self.move_history.pop()  # AI的那步
-            self.move_history.pop()  # 玩家的那步
+            self._rewind(2)
             self.board = self.move_history[-1].copy() if self.move_history else np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=int)
             self.move_count -= 2
         elif self.move_count == 1 and self.gamemode == 1:
             # AI先手的情况，撤回AI第一步，重下天元
-            self.move_history.pop()
+            self._rewind(1)
             self.board = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=int)
             self.move_count = 0
             self.ai_first_move_done = False
+            # _ai_first_move 自己会 _record_score(None)，所以这里不用补
             self._ai_first_move()
             self.board_widget.set_board(self.board)
             self._update_panel()
             return
         elif self.move_count == 1:
-            self.move_history.pop()
+            self._rewind(1)
             self.board = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=int)
             self.move_count = 0
 
@@ -2935,11 +1226,31 @@ class GomokuGame(QMainWindow):
         self.board_widget.set_last_move(None, None, None)
         self._update_panel()
 
+    def _cancel_ai(self):
+        """协作式取消正在运行的 AI 搜索并等待其退出。
+
+        不用 QThread.terminate()：那会在任意字节码处强杀线程，搜索正在做
+        make/unmake 时被杀死会留下不一致状态。配合引擎的取消轮询，
+        正常应在一次节点轮询之内退出，这里给 3 秒余量。
+
+        **先递增代数再等待**，这一步不能省：等待有超时上限，而引擎此刻未必
+        实现了取消轮询（Phase 1 就是如此）。超时后线程仍在跑，它的结果稍后
+        会作为信号投递回来 —— 那个时刻对局可能已经被重开、日志文件已经关闭，
+        于是写日志直接抛 ValueError（在 Qt 槽里会一路冒泡成崩溃）。
+        递增代数让这份迟到的结果在 `_on_ai_finished` 入口就被丢弃。
+        """
+        self._ai_generation += 1     # 立刻作废所有在途结果，早于下面可能超时的等待
+        w = self.ai_worker
+        if w is not None and w.isRunning():
+            w.cancel()
+            if not w.wait(3000):
+                print("[警告] AI 线程未在 3 秒内响应取消")
+        self.ai_worker = None
+        self.ai_thinking = False
+
     def _on_restart(self):
         """重新开始"""
-        if self.ai_worker and self.ai_worker.isRunning():
-            self.ai_worker.terminate()
-            self.ai_worker.wait()
+        self._cancel_ai()
         if self.logger:
             print(f"[日志] 对局日志已保存: {self.logger.filepath}")
             self.logger.close()
@@ -2947,6 +1258,7 @@ class GomokuGame(QMainWindow):
 
     def _on_quit(self):
         """退出"""
+        self._cancel_ai()
         if self.logger:
             try:
                 self.logger.close()
@@ -2970,7 +1282,16 @@ class GomokuGame(QMainWindow):
         else:
             status = "进行中"
 
-        self.game_panel.update_info(turn, self.gamekunnan, status, self.output, self.move_count)
+        human = 1 if self.gamemode == 0 else 2
+        self.game_panel.update_info(turn, self.gamekunnan, status,
+                                    self.output, self.move_count, human=human)
+
+        # 悬停幽灵子只在**轮到玩家**时出现，且用玩家自己的颜色：AI 思考中还给
+        # 预览、或玩家执白却预览黑子，都是在骗人。
+        if self.board_widget is not None:
+            self.board_widget.set_hover_player(
+                human if (turn == human and not self.ai_thinking
+                          and not self.game_over) else None)
 
     def _show_game_over(self):
         """显示游戏结束覆盖层"""
@@ -2998,27 +1319,50 @@ class GomokuGame(QMainWindow):
         overlay.restart_clicked.connect(self._on_restart)
         overlay.quit_clicked.connect(self._on_quit)
 
-        # 将覆盖层添加到game_widget上
+        # 几何完全交给 QStackedLayout(StackAll)：遮罩与棋盘行共用同一块区域，
+        # 尺寸随窗口走。**不要**再 setGeometry —— 那会和布局打架。
         self.game_over_overlay = overlay
-        self.game_widget.layout().addWidget(overlay)
-        overlay.setGeometry(self.game_widget.rect())
-        overlay.show()
-        overlay.raise_()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if self.game_over_overlay:
-            self.game_over_overlay.setGeometry(self.game_widget.rect())
+        self._stack.addWidget(overlay)
+        self._stack.setCurrentWidget(overlay)
+        anim.fade_in(overlay)
 
 
 # ==================== 入口 ====================
+def _fix_qt_plugin_path():
+    """构造 QApplication 之前修正 Qt 插件搜索路径。
+
+    当项目路径含非 ASCII 字符（例如中文的"桌面"）时，Qt 在初始化阶段会丢掉
+    插件目录，报 "Could not find the Qt platform plugin" 而无法启动。
+    这里从 PyQt5 的安装位置反推插件目录并显式写入环境变量，
+    pip / venv / 系统包各种安装方式下都成立。
+    """
+    if os.environ.get('QT_QPA_PLATFORM_PLUGIN_PATH'):
+        return
+    try:
+        import PyQt5
+        platforms = os.path.join(os.path.dirname(PyQt5.__file__),
+                                 'Qt5', 'plugins', 'platforms')
+        if os.path.isdir(platforms):
+            os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = os.path.dirname(platforms)
+    except Exception:
+        pass
+
+
 def main():
+    _fix_qt_plugin_path()
+
+    # 高 DPI 属性**必须在 QApplication 构造之前**设置，构造之后设无效。
+    # 刻意放在 main() 里而不是模块级 import：gui_smoke 自建 QApplication 且
+    # 不经过 main()，于是 CI 上 DPR 恒为 1.0，所有像素几何断言都是确定的。
+    # （真要放进模块级，就得改用 QT_ENABLE_HIGHDPI_SCALING 环境变量 —— 那个
+    #   是进程级的，同样会污染测试。）
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-
-    # 全局字体
-    font = QFont("Microsoft YaHei", 10)
-    app.setFont(font)
+    # 字体不在这里设：theme.install() 同时设 QSS 的 font-family 与 app.setFont，
+    # 两者同源。在这里再写一个 QFont 只会被 QSS 覆盖，看着像生效了其实没有。
 
     window = GomokuGame()
     window.show()

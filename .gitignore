@@ -14,3 +14,13 @@ wsl_build.sh
 wsl_install.sh
 wuziqi_copy/
 wuziqi_env/
+.venv/
+
+# 工具产出（可重新生成；基线数字记录在 tools/BASELINE.md）
+tools/reports/
+.pytest_cache/
+
+# 对局日志：每局游戏都会生成新文件，只增不减，不入库。
+# 诊断用的历史日志已固化进 tools/positions.py 的题库，
+# 原文件在提交 d232fa7 里仍可取（见 tools/BASELINE.md）。
+game_log_*.txt
