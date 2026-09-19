@@ -5,21 +5,25 @@
 # 只有两个。旧版依赖里的 torch 已经删干净了（GPU 分支从未真正生效），
 # 连带收益是包体积 —— 见 README「打包为 EXE」。
 #
-# 上界写 `<下一个大版本` 而不是精确钉死：`numpy 2.0` 移除了一批 API
-# （`np.float_` / `np.alltrue` / `np.in1d` 等），本仓库**一个都没用**
-# （已全仓扫描确认），所以 2.x 整个系列都是安全区间。反过来，1.x 不再
-# 支持 —— 开发与 CI 都在 2.x 上跑，没有理由声称 1.x 也行。
+# **不锁版本。** 这里列的是"需要什么"，不是"某次装的哪一版" —— 锁版本会
+# 让解析器被迫挑某个具体发行版，弊大于利。需要复现某次构建时，用
+# `pip freeze` 另存一份锁定文件，别写回这里。
 #
-# Python >= 3.11：CI 用 3.11（= Windows 打包版本）与 3.13（= 开发版本）
-# 两个端点，刻意跳过 3.12 —— 它既不发布也不开发。
-
-numpy>=2.0,<3
-
-# PyQt5 自 2024 年起没有再发版，5.15.11 就是当前最新，所以这个下界
-# 实际上等于"用最新的"。
+# ⚠️ **Windows 上有个与版本约束无关的坑，值得知道：**
 #
-# ⚠️ **Linux ARM 打包不走这个文件**：`.github/workflows/build.yml` 的
-# `build-linux-arm` 刻意用 apt 的 `python3-pyqt5`，因为 ARM runner 上
-# pip 装 PyQt5 要从源码编译 Qt，慢到不可接受。那份 job 只从 pip 装
-# numpy 与 pyinstaller。改动这里时记得同步那处。
-PyQt5>=5.15.11,<6
+#   PyQt5 依赖 PyQt5-Qt5，而 PyQt5-Qt5 从 5.15.11 起**只发 Linux/macOS
+#   wheel** —— 最后一个带 Windows wheel 的是 5.15.2。
+#
+#     PyQt5-Qt5 5.15.2              ← 有 win_amd64
+#     PyQt5-Qt5 5.15.11 ~ 5.15.19   ← 只有 manylinux / macosx
+#
+#   按当前平台解析（`pip`）会自动回落到 5.15.2，正常。但做**全平台统一
+#   解析**的工具（如 `uv` 的 project 模式）会先选中 5.15.19，再到 Windows
+#   上安装失败 —— 因为锁定文件里已经写死了那个版本。
+#
+#   这不是版本约束能解决的：把 PyQt5 锁死反而更糟。真遇到时改用
+#   `pip install -r requirements.txt` 或 `uv pip install -r requirements.txt`
+#   （两者都按当前平台解析），而不是 `uv add -r`。
+
+numpy
+PyQt5
