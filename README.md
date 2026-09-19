@@ -64,8 +64,8 @@
 git clone https://github.com/iamlinxuhan/GomokuAI.git
 cd GomokuAI
 
-# 2. 安装依赖
-pip install numpy pyqt5
+# 2. 安装依赖（Python >= 3.11）
+pip install -r requirements.txt
 
 # 3. 运行
 python main.py
@@ -184,7 +184,7 @@ python main.py
 ```
 GomokuAI/
 ├── main.py            # 界面组装 + 游戏流程接线（不含搜索/评估逻辑）
-├── engine.py          # AI 引擎：位棋盘 / 评估 / 搜索 / VCF（零 Qt、零第三方依赖，可脱离界面单测）
+├── engine.py          # AI 引擎：位棋盘 / 评估 / 搜索 / VCF（零 Qt，仅依赖 numpy，可脱离界面单测）
 ├── analysis.py        # 分值 -> 胜率的折算、symlog 映射、读数格式化（纯函数，零 Qt）
 ├── charts.py          # 面板上的两张自绘图表（折线 / 网格 / 标记点）
 ├── gamelog.py         # 对局日志与棋谱坐标格式
@@ -199,6 +199,8 @@ GomokuAI/
 │   ├── positions.py   # 局面题库        analyze_log.py  # 复盘对局日志
 │   ├── gui_smoke.py   # 无头界面冒烟    ui_snapshot.py  # 离屏抓图
 │   └── legacy_engine.py  # 旧引擎逐字快照（不得修改，作为 A/B 对照组）
+├── requirements.txt      # 运行时依赖（numpy / PyQt5）
+├── requirements-dev.txt  # 开发与打包依赖（含 pytest / pyinstaller）
 ├── input.png          # 设计参考图（棋盘配色的取样来源，**运行时不读取**）
 ├── 五子棋.ico          # 程序图标（Windows 打包用）
 └── README.md
@@ -209,8 +211,8 @@ GomokuAI/
 ## 🛠️ 打包为 EXE
 
 ```bash
-# 安装依赖
-pip install numpy PyQt5 pyinstaller
+# 安装依赖（打包工具含在开发依赖里）
+pip install -r requirements-dev.txt
 
 # 打包 (onedir 模式)
 pyinstaller --onedir --windowed --icon="五子棋.ico" --name "GomokuAI" main.py
@@ -227,7 +229,7 @@ PyQt5。
 ## 🧪 测试
 
 ```bash
-pip install pytest
+pip install -r requirements-dev.txt
 python -m pytest -q                     # 全套
 python -m pytest tests/test_vcf.py -q   # 只跑某一块
 python -m pytest -q -m "not perf"       # 跳过机器速度相关的门槛（CI 用这条）

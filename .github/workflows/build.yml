@@ -37,9 +37,12 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
+        # 依赖清单只有 requirements*.txt 一处，不再在这里重复列举 ——
+        # 早先四个 job 各写一行 pip install，加一个依赖要改四处，漏掉一处
+        # 就得到"本地过了 CI 挂"的假象。
         run: |
           python -m pip install --upgrade pip
-          pip install numpy PyQt5 pytest
+          pip install -r requirements-dev.txt
 
       - name: Run test suite
         # -m "not perf"：跳过依赖机器速度的门槛（吞吐 nps / 到达深度）。
@@ -67,7 +70,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install numpy PyQt5 pyinstaller
+          pip install -r requirements-dev.txt
 
       - name: Build (onedir)
         run: |
@@ -176,7 +179,7 @@ jobs:
         run: |
           python3 -m venv .venv
           .venv/bin/pip install --upgrade pip
-          .venv/bin/pip install numpy PyQt5 pyinstaller
+          .venv/bin/pip install -r requirements-dev.txt
 
       - name: Build (onedir)
         run: |
@@ -270,11 +273,15 @@ jobs:
             qtbase5-dev qtchooser qt5-qmake qtbase5-dev-tools
 
       - name: Setup venv & install pip deps
+        # 唯一**不**从 requirements-dev.txt 装依赖的 job：上面 apt 那份
+        # `python3-pyqt5` 已经提供 PyQt5，而 pip 只认自己那份元数据 ——
+        # 喂给它 requirements-dev.txt，它会把 PyQt5 从源码重编一遍 Qt，
+        # 慢到不可接受（这正是这个 job 用 apt 的原因）。所以这里只列
+        # 清单里剩下的两个，改动 requirements.txt 时记得同步。
         run: |
           python3 -m venv --system-site-packages .venv
           .venv/bin/pip install --upgrade pip
-          .venv/bin/pip install numpy
-          .venv/bin/pip install pyinstaller
+          .venv/bin/pip install numpy pyinstaller
           .venv/bin/python -c "from PyQt5.QtWidgets import QApplication; print('PyQt5 OK')"
 
       - name: Build (onedir)

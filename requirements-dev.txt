@@ -1,0 +1,16 @@
+# 五子棋 AI —— 开发与打包依赖
+#
+#     pip install -r requirements-dev.txt
+#
+# 含运行时依赖，外加测试与打包工具。
+
+-r requirements.txt
+
+# 测试。标记定义与告警过滤在 pytest.ini；CI 跑 `-m "not perf"`，
+# 本地跑全量（见 README「测试」）。
+pytest>=8
+
+# 打包成单目录可执行文件（Windows / Linux AMD）。Linux ARM 用 apt 的
+# PyQt5，因此那份 job 只装 numpy 与 pyinstaller 两件（见 requirements.txt
+# 末尾的说明）。
+pyinstaller>=6

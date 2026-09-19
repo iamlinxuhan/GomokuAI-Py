@@ -1,0 +1,25 @@
+# 五子棋 AI —— 运行时依赖
+#
+#     pip install -r requirements.txt
+#
+# 只有两个。旧版依赖里的 torch 已经删干净了（GPU 分支从未真正生效），
+# 连带收益是包体积 —— 见 README「打包为 EXE」。
+#
+# 上界写 `<下一个大版本` 而不是精确钉死：`numpy 2.0` 移除了一批 API
+# （`np.float_` / `np.alltrue` / `np.in1d` 等），本仓库**一个都没用**
+# （已全仓扫描确认），所以 2.x 整个系列都是安全区间。反过来，1.x 不再
+# 支持 —— 开发与 CI 都在 2.x 上跑，没有理由声称 1.x 也行。
+#
+# Python >= 3.11：CI 用 3.11（= Windows 打包版本）与 3.13（= 开发版本）
+# 两个端点，刻意跳过 3.12 —— 它既不发布也不开发。
+
+numpy>=2.0,<3
+
+# PyQt5 自 2024 年起没有再发版，5.15.11 就是当前最新，所以这个下界
+# 实际上等于"用最新的"。
+#
+# ⚠️ **Linux ARM 打包不走这个文件**：`.github/workflows/build.yml` 的
+# `build-linux-arm` 刻意用 apt 的 `python3-pyqt5`，因为 ARM runner 上
+# pip 装 PyQt5 要从源码编译 Qt，慢到不可接受。那份 job 只从 pip 装
+# numpy 与 pyinstaller。改动这里时记得同步那处。
+PyQt5>=5.15.11,<6
