@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.13-blue)
 ![PyQt5](https://img.shields.io/badge/PyQt5-5.x-green)
 ![NumPy](https://img.shields.io/badge/NumPy-✓-orange)
-![Version](https://img.shields.io/badge/version-2.0.0-brightgreen)
+![Version](https://img.shields.io/badge/version-2.0.1-brightgreen)
 
 > **v2.0.0 是一次彻底重写**，评估与搜索层整体替换、界面重构为统一设计系统。
 > 旧版的"分层 TSS 威胁响应""多线防守""拼命模式"**已被删除** —— 它们的判断
@@ -53,16 +53,23 @@
 
 ### 运行方式一：直接下载 Release
 
-从 [Releases](https://github.com/iamlinxuhan/GomokuAI/releases) 下载对应平台的安装包，双击即可运行（无需安装 Python）。
+从 [Releases](https://github.com/iamlinxuhan/GomokuAI-Py/releases) 下载对应平台的安装包，双击即可运行（无需安装 Python）。
 
-**统一版本**：一个安装包，**纯 CPU 运行，不需要显卡驱动，也不需要安装 PyTorch/CUDA**。
+| 平台 | 文件 | 说明 |
+|---|---|---|
+| Windows | `GomokuAI_Setup_vX.Y.Z.exe` | **安装包**（推荐）：向导安装、自动建开始菜单/桌面快捷方式，可在「添加或删除程序」里卸载 |
+| Windows | `GomokuAI_Portable_vX.Y.Z.exe` | **免安装单文件**：拷到哪都能跑，不用安装也不写注册表；代价是每次启动要先把内置的运行时解包到临时目录，首启动较慢 |
+| Linux amd64 | `GomokuAI_For_Linux_AMD.deb` | `sudo dpkg -i` 安装 |
+| Linux arm64 | `GomokuAI_For_Linux_ARM.pkg` | 解包后执行 `./install.sh` |
+
+**统一版本**：都是**纯 CPU 运行，不需要显卡驱动，也不需要安装 PyTorch/CUDA**。
 
 ### 运行方式二：从源码运行
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/iamlinxuhan/GomokuAI.git
-cd GomokuAI
+git clone https://github.com/iamlinxuhan/GomokuAI-Py.git
+cd GomokuAI-Py
 
 # 2. 安装依赖（Python >= 3.11）
 pip install -r requirements.txt
@@ -199,6 +206,8 @@ GomokuAI/
 │   ├── positions.py   # 局面题库        analyze_log.py  # 复盘对局日志
 │   ├── gui_smoke.py   # 无头界面冒烟    ui_snapshot.py  # 离屏抓图
 │   └── legacy_engine.py  # 旧引擎逐字快照（不得修改，作为 A/B 对照组）
+├── installer/
+│   └── GomokuAI.iss   # Windows 安装包脚本（Inno Setup，**UTF-8 带 BOM**，见「打包为 EXE」）
 ├── requirements.txt      # 运行时依赖（numpy / PyQt5）
 ├── requirements-dev.txt  # 开发与打包依赖（含 pytest / pyinstaller）
 ├── input.png          # 设计参考图（棋盘配色的取样来源，**运行时不读取**）
@@ -210,19 +219,57 @@ GomokuAI/
 
 ## 🛠️ 打包为 EXE
 
+Windows 出**两份**产物，各有各的用处（CI 上是这样，本地照做即可）：
+
 ```bash
 # 安装依赖（打包工具含在开发依赖里）
 pip install -r requirements-dev.txt
 
-# 打包 (onedir 模式)
+# ① 安装包的原料：onedir
 pyinstaller --onedir --windowed --icon="五子棋.ico" --name "GomokuAI" main.py
+
+# ② 免安装单文件版：onefile（与 ① 用不同的 --name，见下）
+pyinstaller --onefile --windowed --icon="五子棋.ico" --name "GomokuAI_Portable" main.py
 ```
+
+**为什么是两份而不是一份。** `--onedir` 启动快（运行时就在旁边，直接加载），
+但整个目录几百个文件，不给用户一个安装向导就没法交付；`--onefile` 是单个
+文件、拷走就能跑，代价是**每次启动**都要先把内置的运行时解包到临时目录，
+PyQt5 程序的首次窗口会明显慢一拍。所以：装到硬盘上的那份用 onedir 做成安装
+包，需要"拷到 U 盘/别人机器上就跑"的那份用 onefile。
+
+**两次构建必须用不同的 `--name`。** 否则它们共用 `build/` 与 `dist/` 下的
+同名中间目录，第二次构建会捡起第一次的缓存，产物里混进不该有的东西。
+
+### 安装包（Inno Setup）
+
+`installer/GomokuAI.iss` 把 ① 的产物打成带向导的安装程序：
+
+```bash
+# 装编译器（本地；CI 上是 choco install innosetup）
+winget install JRSoftware.InnoSetup
+
+# 编译（AppVersion 通常由 CI 从 tag 传入）
+& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=2.0.1 installer\GomokuAI.iss
+```
+
+输出到 `dist-installer/GomokuAI_Setup_v<版本>.exe`。它装进
+`%LOCALAPPDATA%\GomokuAI`（不需要管理员权限，不弹 UAC），并在「添加或删除
+程序」里登记卸载项 —— 这两点正是旧的 7z + `install.bat` 方案做不到的。
+
+两个容易踩的坑，都写在 `.iss` 里了：
+
+- **这个文件必须存为「UTF-8 带 BOM」。** 里面有中文（应用名、图标路径）；
+  没有 BOM 时 ISCC 会按 ANSI 解析，中文变乱码。改这个文件时别让编辑器把
+  BOM 吃掉。
+- **中文界面只在编译器自带 `Languages\ChineseSimplified.isl` 时才挂上。**
+  Inno Setup 从 6.3 起才官方收录简体中文，而 `MessagesFile` 指向不存在的
+  文件是编译期硬错。CI 探测到才传 `/DHasChinese=1` —— 用编译器自带的那份
+  而不是把 `.isl` 收进仓库，语言文件与编译器就永远同源、不会版本错配。
 
 不再需要任何 torch 排除参数：依赖里已经没有它了。旧版为了把 CUDA 运行时塞进
 包里，要先腾磁盘、再拆成两个包才不超 GitHub 的 2GB 上限；现在只剩 numpy 与
 PyQt5。
-
-输出文件位于 `dist/GomokuAI/`。
 
 ---
 
@@ -288,6 +335,24 @@ git show d232fa7:README.md | sed -n '236,401p'
 ---
 
 ## 📝 更新日志
+
+### v2.0.1 (2026-09-24)
+
+**打包：Windows 的 `.7z` 换成 `.exe`**（引擎未动，与本版无关）
+
+- ♻️ **安装包改为 Inno Setup 编译的 `.exe`**（`installer/GomokuAI.iss`），
+  取代原来的 `GomokuAI_For_Windows_v*.7z` + `install.bat`。旧方案双击后是
+  一个黑窗口、没有安装向导、「添加或删除程序」里查无此物（卸载要靠另一个
+  `.bat`）、失败时只能 `pause` 让人自己看 —— 这些正是"安装程序"该做的事。
+  新安装包装进 `%LOCALAPPDATA%\GomokuAI`，不需要管理员权限，带向导、带
+  开始菜单/桌面快捷方式、带卸载项。
+- ✨ **另出一份免安装单文件版** `GomokuAI_Portable_v*.exe`（PyInstaller
+  `--onefile`），拷到哪都能跑。两份产物各有各的用处：onedir 启动快，适合
+  装到硬盘上；onefile 免安装，代价是每次启动要先把运行时解包到临时目录。
+- 📝 **仓库地址迁移**：`iamlinxuhan/GomokuAI` → `iamlinxuhan/GomokuAI-Py`，
+  README 里的 Releases / clone 链接随之更新。
+- 📝 `.gitignore` 补上 `dist-installer/`（Inno 的输出目录）—— 它**不**被
+  原有的 `dist/` 覆盖：带斜杠的模式只匹配同名的目录。
 
 ### v2.0.0 (2026-09-19)
 

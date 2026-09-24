@@ -1,6 +1,10 @@
 # 打包产物
 build/
 dist/
+# Inno Setup 的输出目录（`installer/GomokuAI.iss` 里的 OutputDir）。
+# 注意它**不**被上面的 `dist/` 覆盖 —— 带斜杠的模式只匹配同名的目录，
+# `dist-installer/` 是不同的名字。
+dist-installer/
 *.spec
 __pycache__/
 *.pyc
