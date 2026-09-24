@@ -1135,6 +1135,17 @@ VCF_NO_WIN = 0
 VCF_EXHAUSTED = -1
 
 VCF_MAX_PLY = 24            # 一条 VCF 最多 24 手（12 回合），覆盖实战杀棋
+
+# `_vcf_defence` 的两个否定答案。**它们不是一回事**：NONE 是"候选集扫完了，
+# 没有一手能破坏对手的 VCF"，UNKNOWN 是"预算用尽，没扫完"。混成一个返回值
+# 会让调用方分不清"证明它没用"与"还没算"，于是日志里两种情况说同一句话 ——
+# 诊断 `game_log_20260922_235240` 那局时正是被这句话绊住的。
+#
+# 注意 NONE **不等于"必败"**：候选集只是"对手可以用来做四的格点"，挡点可能
+# 在集合之外，也可以靠反冲四解。所以它只能用来排序，不能拿它编一个杀棋分
+# （见 `tests/test_vcf.py` 的 `test_vcf_defence_does_not_invent_a_score`）。
+VCF_DEFENCE_NONE = -1       # 扫完了，没有一手能破坏它
+VCF_DEFENCE_UNKNOWN = -2    # 预算用尽，没扫完
 _VCF_POLL_MASK = 255        # 每 256 个 VCF 节点轮询一次预算
 _VCF_NODE_CAP = 120000      # 一次 VCF 阶段的节点上限：时间之外的兜底闸门
 
@@ -1157,12 +1168,33 @@ class _VcfStop(Exception):
 # 于是必须一起调：3.0 秒给出的 2.55 秒预算，扣掉 VCF 最多 0.3 秒，主搜索仍余
 # 2.25 秒 > 第 4 层所需的 1.55 秒。
 #
-# 代价要如实说：初级与中级在开阔中盘会到达相近的深度（2 档的 4.25 秒在同一
-# 局面也只到第 4 层）。阶梯的真正分野是 `max_depth` 4/10/24 —— 要在窄树上
-# 2/3 档才拉得开。
+# 代价要如实说：低档之间在开阔中盘会到达相近的深度，阶梯的真正分野是
+# `max_depth` 4/10/24 —— 要在窄树上才拉得开。
+#
+# **2 档的 7.0 秒是被一个具体局面定出来的，不是拍的。** 那局
+# （`game_log_20260922_235240`，2 档执白，人类第 31 手 J8 胜）的胜负手在第 4 手：
+# 盘面只有三颗子时，第 4 层选 K9（−1000），第 5 层选 K7/K11（−170）。把这一手
+# 钉死、其余着法仍用旧预算重放（`tools/pivot_ab.py --budget 5.0`）：走 K9 得到
+# 黑胜·第 31 手 J8，而且**与日志逐手相同（31 手一手不差）**；走 K7 / K11 则是
+# 白方第 12 / 18 手反杀。
+#
+# **旧预算的问题不是"差一点深度"，是压在临界点上。** 同一份输入重复搜这一手，
+# 5.0 秒会给出两种答案（`--stability`）：空载 12 次里 3 次走 K9、另一批 8 次里
+# 0 次，而起 6 个满载进程后 **4/4 全走 K9** —— 稍忙的机器上就固定下出那盘败局。
+#
+#     time=5.0（旧值）  预算 4250ms  K7(5层) 与 K9(4层) 交替 —— 随负载翻面
+#     time=6.0          预算 5100ms  K7 · 5 层   5/5 稳定
+#     time=7.0          预算 5950ms  K7 · 5 层   4/4 稳定
+#
+# 取 7.0 而不是 6.0：够不够得着第 5 层由 6.0 决定，7.0 在其上多留约 0.85 秒，
+# 买的是"不随负载翻面"—— 这正是 5.0 出事的原因。
+#
+# **这是把地平线推远，不是治好了。** 任何固定预算都有地平线，下一个局面总会
+# 有需要更深一层才看得见的棋。这条时限只保证"这一个局面看得见"，而且它是对着
+# 一条人类着法线定的：换成同级引擎对手，白方并不因此就必胜。
 DIFFICULTY = {
     1: dict(time=3.0, max_depth=4, vcf_budget=0.3, qply=4),
-    2: dict(time=5.0, max_depth=10, vcf_budget=0.5, qply=8),
+    2: dict(time=7.0, max_depth=10, vcf_budget=0.5, qply=8),
     3: dict(time=15.0, max_depth=24, vcf_budget=1.5, qply=10),
 }
 RESERVE = 0.15              # 留给回传与 UI 的余量，从时间上限里扣
@@ -1618,16 +1650,23 @@ class Engine:
         若每个候选各自计时，总时长会变成"候选数 × 预算"，那正是 plan §风险里
         写的"VCF 防守候选集爆炸"。
 
-        返回 -1 表示"没找到确有把握的挡法"（含预算不够的情况），调用方退回
-        常规搜索。这里刻意**不实现** plan 里"以攻对攻，走己方 VCF 最深进展
-        着法"那一条：主搜索（深度 24 + 静止搜索）对同一局面的判断严格强于
-        "挑一条 VCF 走得最远的着法"这种启发式，旧引擎的"拼命模式"正是这类
-        启发式的失败案例。
+        返回 ``-1`` 以上的索引表示找到；负数有两个取值，**含义不同**：
+
+        - `VCF_DEFENCE_NONE`（-1）—— 候选集扫完了，没有一手能破坏它。
+          **这不等于必败**：候选集只是"对手可以用来做四的格点"，挡点可能在
+          集合之外，也可以靠反冲四解。所以它只能用来排序，不能拿它编杀棋分。
+        - `VCF_DEFENCE_UNKNOWN`（-2）—— 预算用尽，没扫完。连"有没有挡点"
+          都没算出来。
+
+        两种情况下调用方都退回常规搜索。这里刻意**不实现** plan 里"以攻对攻，
+        走己方 VCF 最深进展着法"那一条：主搜索（深度 24 + 静止搜索）对同一
+        局面的判断严格强于"挑一条 VCF 走得最远的着法"这种启发式，旧引擎的
+        "拼命模式"正是这类启发式的失败案例。
         """
         cand = _hot_points(bd.bits_of(opp), bd.bits_of(me))
         for mv in _mask_cells(cand):
             if time.monotonic() >= deadline:
-                return -1
+                return VCF_DEFENCE_UNKNOWN
             bd.make(mv, me)
             try:
                 st, _, _ = self.vcf(bd, opp, 0.0, deadline=deadline)
@@ -1635,7 +1674,7 @@ class Engine:
                 bd.unmake(mv, me)
             if st == VCF_NO_WIN:
                 return mv
-        return -1
+        return VCF_DEFENCE_NONE
 
     def think(self, board, me, level, *, cancel=None, time_limit=None):
         """搜索一步棋。``board`` 是 ndarray（**不会被修改**）。
@@ -1706,7 +1745,9 @@ class Engine:
         vcf_budget = cfg.get("vcf_budget", 0.0)
         vcf_phase_deadline = t0 + vcf_budget
         vcf_win = None                   # (move, value) 已证明的必胜
-        vcf_defence = -1                 # 已证明能破坏对手 VCF 的一手
+        # 已证明能破坏对手 VCF 的一手。初值与 `VCF_DEFENCE_NONE` 同值 —— 两者
+        # 都读作"没有可用的挡点"，唯一的消费者是下面那句 `vcf_defence >= 0`。
+        vcf_defence = VCF_DEFENCE_NONE
         if vcf_budget > 0.0:
             try:
                 vst, vmv, vdist = self.vcf(bd, me, vcf_budget)
@@ -1725,6 +1766,10 @@ class Engine:
                     ost, _, odist = self.vcf(bd, opp, 0.0,
                                              deadline=vcf_phase_deadline)
                     if ost == VCF_WIN:
+                        # 威胁有多深是**已经算出来的事实**，两个分支都记 ——
+                        # 只在找到挡点时记，日志里就看不出"对手还有几手成杀"，
+                        # 而诊断败局时缺的正是这个数。
+                        info.update(vcf_dist=odist)
                         d = self._vcf_defence(bd, me, opp, vcf_phase_deadline)
                         if d >= 0:
                             # 只把它排到第一位，**不写 reason** —— 搜索完全可能
@@ -1732,9 +1777,14 @@ class Engine:
                             # VCF 挡点"就是假话。reason 在循环后按最终着法补。
                             first = best_move = d
                             vcf_defence = d
-                            info.update(vcf_dist=odist)
+                        elif d == VCF_DEFENCE_UNKNOWN:
+                            # 没扫完 ≠ 没有挡点。这两种情况以前共用一个 -1，
+                            # 日志里说同一句话，等于把"不知道"讲成了"算过了"。
+                            info.update(reason='PVS搜索(对手有VCF·未算完)')
                         else:
-                            info.update(reason='PVS搜索(对手有VCF)')
+                            # 扫完了、没找到。**仍然不是"必败"**，所以分值照旧
+                            # 由搜索给（见 `_vcf_defence` 的 docstring）。
+                            info.update(reason='PVS搜索(对手有VCF·无挡点)')
             except SearchAborted:
                 # VCF 阶段撞上主搜索的截止/取消：改成"不表态"，照常进入迭代
                 # 加深。这里**不能**把 EXHAUSTED 当 NO_WIN —— 那正是 B15。

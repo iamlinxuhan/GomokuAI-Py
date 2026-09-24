@@ -312,6 +312,40 @@ def test_vcf_defence_does_not_invent_a_score():
     # reason 与着法必须一致：标了 VCF 就必须真的走在挡点上，走在别处就
     # 不许标。这条挡的是"标记与实际不符"这类只在输出里看得出、下棋时
     # 看不出的错。
-    said_vcf = "VCF" in (info["reason"] or "")
+    #
+    # **判据是"来源字符串"，不是 `"VCF" in reason`。** 后者曾是对的，直到
+    # `PVS搜索(对手有VCF·无挡点/未算完)` 这两句出现 —— 它们说的是**对手**有
+    # 冲四链，不是说这一手是挡点，子串判据会把它们误判成"标了 VCF"。枚举
+    # `VCF_PROVENANCE` 才能把"这一手的来路是 VCF"与"这个局面里别人有 VCF"
+    # 分开。
+    said_vcf = (info["reason"] or "") in VCF_PROVENANCE
     assert said_vcf == ((r, c) == rc(d)), (
         f"reason={info['reason']!r} 与实际着法 {(r, c)} / 挡点 {rc(d)} 不一致")
+
+
+# 唯一两句**宣称这一手的来路是 VCF** 的 reason。`连续冲四(VCF)` 是我方杀棋，
+# `连续冲四防守(VCF)` 是挡点，两句都蕴含"这一手就是 VCF 算出来的那一手"。
+VCF_PROVENANCE = ("连续冲四(VCF)", "连续冲四防守(VCF)")
+
+
+def test_vcf_defence_reports_unknown_when_the_budget_is_gone():
+    """预算用尽必须返回 `VCF_DEFENCE_UNKNOWN`，**不能**返回 `_NONE`。
+
+    两者以前共用一个 -1，于是"没算完"被读成"算过了、没有挡点"—— 日志里说
+    同一句话。这条用例把两个否定答案钉开：deadline 取一个已经过去的时刻，
+    扫描在第 0 个候选上就撞线，返回值必须是 UNKNOWN。
+    """
+    board = mk(DEF_BLACK, DEF_WHITE)
+    eng = E.Engine()
+    eng._deadline = 0.0
+    d = eng._vcf_defence(E.Board.from_array(board), 2, 1, time.monotonic() - 1.0)
+    assert d == E.VCF_DEFENCE_UNKNOWN, (
+        f"预算早就没了，却返回了 {d}（NONE={E.VCF_DEFENCE_NONE}）"
+        f"—— 这是把'不知道'讲成了'算过了'")
+
+    # 同一个局面，给足预算就必须走另一条路。两条一起断言，才说明区分的是
+    # 预算而不是局面。
+    eng2 = E.Engine()
+    eng2._deadline = 0.0
+    d2 = eng2._vcf_defence(E.Board.from_array(board), 2, 1, time.monotonic() + 1.0)
+    assert d2 >= 0, "同一局面给足预算应当找得到挡点"

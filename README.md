@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.13-blue)
 ![PyQt5](https://img.shields.io/badge/PyQt5-5.x-green)
 ![NumPy](https://img.shields.io/badge/NumPy-✓-orange)
-![Version](https://img.shields.io/badge/version-2.0.1-brightgreen)
+![Version](https://img.shields.io/badge/version-2.0.2-brightgreen)
 
 > **v2.0.0 是一次彻底重写**，评估与搜索层整体替换、界面重构为统一设计系统。
 > 旧版的"分层 TSS 威胁响应""多线防守""拼命模式"**已被删除** —— 它们的判断
@@ -58,11 +58,26 @@
 | 平台 | 文件 | 说明 |
 |---|---|---|
 | Windows | `GomokuAI_Setup_vX.Y.Z.exe` | **安装包**（推荐）：向导安装、自动建开始菜单/桌面快捷方式，可在「添加或删除程序」里卸载 |
-| Windows | `GomokuAI_Portable_vX.Y.Z.exe` | **免安装单文件**：拷到哪都能跑，不用安装也不写注册表；代价是每次启动要先把内置的运行时解包到临时目录，首启动较慢 |
-| Linux amd64 | `GomokuAI_For_Linux_AMD.deb` | `sudo dpkg -i` 安装 |
-| Linux arm64 | `GomokuAI_For_Linux_ARM.pkg` | 解包后执行 `./install.sh` |
+| Windows | `GomokuAI_Portable_vX.Y.Z.exe` | **免安装**：单个 exe，拷到哪都能跑，不写注册表 |
+| Linux amd64 | `GomokuAI_For_Linux_AMD.deb` | **安装包**（推荐）：`sudo dpkg -i`，声明了依赖 |
+| Linux amd64 | `GomokuAI_For_Linux_AMD` | **免安装**：单个可执行文件，`chmod +x` 后直接运行 |
+| Linux arm64 | `GomokuAI_For_Linux_ARM.pkg` | **安装包**：解包后 `sudo ./install.sh` |
+| Linux arm64 | `GomokuAI_For_Linux_ARM` | **免安装**：同上，arm64 架构 |
 
 **统一版本**：都是**纯 CPU 运行，不需要显卡驱动，也不需要安装 PyTorch/CUDA**。
+
+**免安装的那几份不声明依赖。** 系统里缺 `libgl1` / xcb 那几个库、或者一个中文字体
+都没有时，它们不会替你装 —— 只会启动失败或满屏方框。`.deb` / `.pkg` 会把这些
+一起装上（含 CJK 字体候选链），所以**不确定装哪个就用安装包**。
+
+Linux 的免安装版是**裸可执行文件，没有扩展名**，下载后要先给可执行位：
+
+```bash
+chmod +x GomokuAI_For_Linux_AMD
+./GomokuAI_For_Linux_AMD
+```
+
+（Release 资产不携带文件权限，这一步谁都替不了你。）
 
 ### 运行方式二：从源码运行
 
@@ -95,7 +110,7 @@ python main.py
 | 难度 | 每步时限 | 深度上限 | 静止搜索层数 | VCF 预算 |
 |------|---------|---------|------------|---------|
 | **初级** | 3 s | 4 | 4 | 0.3 s |
-| **中级** | 5 s | 10 | 8 | 0.5 s |
+| **中级** | 7 s | 10 | 8 | 0.5 s |
 | **高级** | 15 s | 24 | 10 | 1.5 s |
 
 三点需要说清：
@@ -109,21 +124,53 @@ python main.py
   盘面固化在 `tests/test_difficulty.py` 的 `LOST_183202_P28`）。现在低档的
   区分度由**深度上限**承担，不靠缺失子系统。
 
-**代价要如实说**：初级与中级在开阔中盘会到达相近的深度（中级的 4.25 秒
-预算在同样局面也只到第 4 层）。阶梯的真正分野是 `max_depth` 4/10/24 ——
-要在窄树上 2/3 档才拉得开。
+**中级的 7 秒是被一个具体局面定出来的，不是拍的。** 那局
+（`game_log_20260922_235240`，中级执白、人类第 31 手 J8 胜）的胜负手在第 4 手：
+盘面只有三颗子时，**第 4 层选 K9，第 5 层选 K7/K11** —— 相邻两层给出胜负相反
+的结论。把这一手钉死、其余着法仍用旧预算重放
+（`python tools/pivot_ab.py --budget 5.0`）：走 K9 得到**黑胜 · 第 31 手 J8**，
+而且与日志**逐手相同 —— 31 手一手不差**；走 K7 或 K11 则是白方第 12 / 18 手
+反杀。这一手就是那盘棋的全部，后面 27 手都只是症状。
+
+**旧预算的问题不是"差一点深度"，是压在临界点上。** 同一份输入、同一个 5.0 s
+预算，重复搜这一手会给出**两种答案**：
+
+| `time` | 预算 | 第 4 手实测 |
+|---|---|---|
+| 5.0（旧值） | 4250 ms | K7·5 层 与 **K9·4 层** 交替出现 —— 分三批测出 3/12、0/8，**负载下 4/4** |
+| 6.0 | 5100 ms | K7 · 5 层，5/5 稳定 |
+| **7.0** | 5950 ms | K7 · 5 层 · val −170，4/4 稳定 |
+
+第三列里 5.0 那一行的**三批数字本身就是结论**：比例随机器当时多忙而变 ——
+起 6 个满载进程后 4/4 全走败着。也就是说在稍忙的机器上，中级档一开局就固定
+下出那盘败局。7.0 相对实测的第一稳定点 6.0 留了约 0.85 s，这是取 7.0 而不是
+6.0 的理由。
+
+量它的办法是 `python tools/pivot_ab.py --budget 5.0 --stability N`：**空载时
+多半只看到 K7**，想把败着逼出来，得让机器忙起来再跑同一个命令。
+
+**这是把地平线推远，不是治好了。** 任何固定预算都有地平线 —— 下一个局面总会
+有需要更深一层才看得见的棋。这条时限只保证"这一个局面看得见"，而且它是**对着
+一条人类着法线**定的：换成同级引擎对手，白方并不因此就必胜。
+
+**代价要如实说**：低档之间在**开阔中盘**仍会到达相近的深度，而阶梯的真正
+分野是 `max_depth` 4/10/24 —— 要在窄树上才拉得开。
 
 实测（`python tools/bench.py --engine engine --level N`，5 个固定局面）。
 注意"深度上限"是配置值、"深度中位"是实际到达值，两者不是一回事：
 
 | 档 | 墙钟中位 / 最大 | 深度中位 / 最大 | nps 中位 | 时间合规 |
 |---|---|---|---|---|
-| 初级 | 754 ms / 2553 ms | 4 / 4 | 51,547 | 5/5 |
-| 中级 | 4252 ms / 4268 ms | 4 / 4 | 39,224 | 5/5 |
-| 高级 | 12 752 ms / 12 781 ms | 5 / 5 | 48,407 | 5/5 |
+| 初级 | 718 ms / 2552 ms | 4 / 4 | 54,155 | 5/5 |
+| 中级 | 5956 ms / 5978 ms | 4 / 4 | 50,700 | 5/5 |
+| 高级 | 12 769 ms / 12 789 ms | 5 / 5 | 48,873 | 5/5 |
 
-（2026-09-19 实测。三档的深度**最小**值都是 1，那是 `mid_10stones` —— 一个
+（2026-09-23 实测。三档的深度**最小**值都是 1，那是 `mid_10stones` —— 一个
 已被判定的局面，迭代加深在找到杀棋后立刻收敛，深度低是因为它没什么可搜的。）
+
+注意中级这一行：**这 5 个局面里中级仍然只到第 4 层**（它们不是上面那个第 4 手
+的局面），所以中级的 7 秒在这里表现为"走满时间、深度不变"。深度门槛跟局面走，
+不跟档位走。
 
 **这张表读的是"这 5 个局面有多快解决"，不是"引擎总是这么快"。** 它们里
 好几个是**已经被判定的局面** —— 例如 `mid_10stones` 的轮走方已经必败
@@ -207,7 +254,7 @@ GomokuAI/
 │   ├── gui_smoke.py   # 无头界面冒烟    ui_snapshot.py  # 离屏抓图
 │   └── legacy_engine.py  # 旧引擎逐字快照（不得修改，作为 A/B 对照组）
 ├── installer/
-│   └── GomokuAI.iss   # Windows 安装包脚本（Inno Setup，**UTF-8 带 BOM**，见「打包为 EXE」）
+│   └── GomokuAI.iss   # Windows 安装包脚本（Inno Setup，**UTF-8 带 BOM**，见「打包」）
 ├── requirements.txt      # 运行时依赖（numpy / PyQt5）
 ├── requirements-dev.txt  # 开发与打包依赖（含 pytest / pyinstaller）
 ├── input.png          # 设计参考图（棋盘配色的取样来源，**运行时不读取**）
@@ -217,9 +264,11 @@ GomokuAI/
 
 ---
 
-## 🛠️ 打包为 EXE
+## 🛠️ 打包（Windows / Linux）
 
-Windows 出**两份**产物，各有各的用处（CI 上是这样，本地照做即可）：
+两边都是**两份产物**：一份装进系统，一份免安装。CI 上就是这样，本地照做即可。
+
+### Windows
 
 ```bash
 # 安装依赖（打包工具含在开发依赖里）
@@ -250,7 +299,7 @@ PyQt5 程序的首次窗口会明显慢一拍。所以：装到硬盘上的那�
 winget install JRSoftware.InnoSetup
 
 # 编译（AppVersion 通常由 CI 从 tag 传入）
-& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=2.0.1 installer\GomokuAI.iss
+& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=2.0.2 installer\GomokuAI.iss
 ```
 
 输出到 `dist-installer/GomokuAI_Setup_v<版本>.exe`。它装进
@@ -271,6 +320,30 @@ winget install JRSoftware.InnoSetup
 包里，要先腾磁盘、再拆成两个包才不超 GitHub 的 2GB 上限；现在只剩 numpy 与
 PyQt5。
 
+### Linux
+
+```bash
+# ① 安装包的原料：onedir
+pyinstaller --onedir --windowed --name "gomoku-ai" main.py     # arm64 用 gomoku-ai-arm
+
+# ② 免安装可执行文件：onefile
+pyinstaller --onefile --windowed --name "GomokuAI_For_Linux_AMD" main.py
+```
+
+② 出来的 `dist/GomokuAI_For_Linux_AMD` 就是 Release 上那份**裸可执行文件**
+（无扩展名），`chmod +x` 后直接运行。① 那份分别由 `.deb`（`dpkg-deb`）和
+`.pkg`（`tar` + `install.sh`）收进系统，脚本都在 CI 里，见
+[build.yml](.github/workflows/build.yml)。
+
+**Linux 的 onefile 有两个 Windows 上没有的注意点**：
+
+- **它声明不了依赖。** `.deb` 能在 `Depends:` 里列出 `libgl1`、xcb 那几个库和
+  CJK 字体候选链，裸文件不能 —— 缺什么就报什么（或者满屏方框）。这是它必须
+  和 `.deb` 并存、而不是取代 `.deb` 的原因。
+- **可执行位不在文件里。** Release 资产只存字节，用户下到的文件是 `0644`，
+  必须自己 `chmod +x`。artifact 那一趟（`upload-artifact`）同样不保留权限。
+  CI 不做任何补偿 —— 补偿不了，只能在 README 里写清楚。
+
 ---
 
 ## 🧪 测试
@@ -284,8 +357,8 @@ python -m pytest -q -m "not perf"       # 跳过机器速度相关的门槛（CI
 
 **关于 `perf` 标记**：少数门槛测的是"引擎有没有退化"，但读数是"每秒多少
 节点""3 秒内到了第几层"—— 在更慢的机器上，退化和慢机器在数字上无法区分。
-这类用例标记为 `perf`，CI 跳过（`-m "not perf"`，**302 条**），本地跑全量
-（**322 条**）。**正确性、增量一致性、时间合规、
+这类用例标记为 `perf`，CI 跳过（`-m "not perf"`，**303 条**），本地跑全量
+（**324 条**）。**正确性、增量一致性、时间合规、
 题库、VCF、棋型判定这些都不带标记**，它们在任意机器上都该通过 —— 时间上下限
 由引擎自己强制，与机器快慢无关。
 
@@ -307,7 +380,8 @@ python -m pytest -q -m "not perf"       # 跳过机器速度相关的门槛（CI
 
 另有 `tools/gui_smoke.py`（无头界面冒烟）、`tools/ui_snapshot.py`（离屏抓图）、
 `tools/bench.py`（基准）、`tools/selfplay.py`（对旧引擎 A/B 胜率）、
-`tools/positions.py`（局面题库）、`tools/analyze_log.py`（复盘对局日志）。
+`tools/positions.py`（局面题库）、`tools/analyze_log.py`（复盘对局日志）、
+`tools/pivot_ab.py`（把某一手钉死或重复搜，量化时限的影响）。
 
 ---
 
@@ -335,6 +409,44 @@ git show d232fa7:README.md | sed -n '236,401p'
 ---
 
 ## 📝 更新日志
+
+### v2.0.2 (2026-09-24)
+
+**引擎**
+
+- 🐛 **中级档的时限 5.0 s → 7.0 s**：一条真实败局
+  （`game_log_20260922_235240`，中级执白、人类第 31 手 J8 胜）的胜负手在第 4
+  手 —— 盘面只有三颗子时，**第 4 层选 K9，第 5 层选 K7/K11**，相邻两层给出
+  胜负相反的结论。把这一手钉死、其余仍用旧预算重放：走 K9 得到
+  **黑胜 · 第 31 手 J8**，与日志**逐手相同（31 手一手不差）**；走 K7 / K11
+  则是白方第 12 / 18 手反杀。旧预算 `5.0 × 0.85 = 4250 ms` 恰好压在临界点上
+  —— 同一份输入重复搜，
+  5.0 s 下 K7 与 K9 **交替出现**（空载 12 次里 3 次走 K9、另一批 8 次里 0 次，
+  起 6 个满载进程后 **4/4 全走 K9**），6.0 s 起才稳定在第 5 层，7.0 s 在其上
+  留约 0.85 s 余量。**这是把地平线推远，不是治好了** —— 见「难度说明」一节。
+- 🐛 **日志不再把"没算完"讲成"算过了"**：`_vcf_defence` 原先用同一个 `-1`
+  表示"候选集扫完了、没有挡点"与"预算用尽、没扫完"，调用方分不开，于是两种
+  情况在日志里说同一句 `PVS搜索(对手有VCF)`。现在分成
+  `VCF_DEFENCE_NONE` / `VCF_DEFENCE_UNKNOWN` 两个取值，`reason` 各说各的。
+  顺带把对手的冲四威胁深度（`vcf_dist`）从"只在找到挡点时记"改为总是记录 ——
+  诊断那局时缺的正是这个数。
+- ✨ 新增两条护栏：`test_difficulty.py::test_mid_level_sees_the_fifth_layer_
+  on_the_pivot_move`（`perf`，中级必须在那第 4 手上看到第 5 层）、
+  `test_vcf.py::test_vcf_defence_reports_unknown_when_the_budget_is_gone`。
+- ✨ 新增 `tools/pivot_ab.py`：把上面那条"这一手是胜负手"做成可复现的对照 ——
+  `--budget 5.0` 分别钉死 K9 / K7 / K11 看结局，`--stability N` 则同一份输入
+  重复搜 N 次、统计引擎自己选了什么（"临界点上会翻面"就是靠它测出来的）。
+
+**打包**
+
+- ✨ **Linux 增加免安装可执行文件** `GomokuAI_For_Linux_AMD` /
+  `GomokuAI_For_Linux_ARM`（PyInstaller `--onefile`）：无扩展名，`chmod +x`
+  就能跑，不要 root、不写 `/opt`、没有安装脚本。**与已有的 `.deb` / `.pkg`
+  并存，不是取代** —— 那两份能在 `Depends:` 里声明图形库与 CJK 字体候选链，
+  裸文件声明不了，缺什么就报什么（或满屏方框）。
+- 📝 README 的「打包」一节拆成 Windows / Linux 两段，写明 Linux 的 onefile
+  为什么取代不了 `.deb`，以及可执行位为什么只能由用户自己加（Release 资产
+  只存字节，`upload-artifact` 同样不保留权限 —— CI 补偿不了这件事）。
 
 ### v2.0.1 (2026-09-24)
 

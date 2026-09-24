@@ -158,10 +158,13 @@ jobs:
 
 
   # ============================================================
-  #  Linux AMD64 统一 .deb — onedir → /opt/
+  #  Linux AMD64 — 免安装裸可执行文件 + .deb（onedir → /opt/）
   #  纯 CPU：不再需要 pytorch/pytorch 那个预装 CUDA 的镜像，
   #  换回普通 runner —— 镜像本身就有 ~7GB，而它提供的东西（CUDA 运行时）
   #  现在一件都用不上。顺带省掉了"清磁盘"那一步。
+  #
+  #  两份产物都要：.deb 管"装进系统、有菜单项、能卸载"，裸可执行文件管
+  #  "下下来 chmod +x 就跑、不要 root、不碰系统目录"。
   # ============================================================
   build-linux-amd:
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
@@ -189,8 +192,18 @@ jobs:
           .venv/bin/pip install -r requirements-dev.txt
 
       - name: Build (onedir)
+        # .deb 的原料。
         run: |
           .venv/bin/pyinstaller --onedir --windowed --name "gomoku-ai" main.py
+
+      - name: Build standalone executable (onefile)
+        # 免安装版本：单个 ELF，下下来 `chmod +x` 就能跑。与上一份用不同的
+        # --name，否则两者共用 build/ 与 dist/ 下的同名中间目录，第二次构建
+        # 会捡起第一次的缓存。
+        run: |
+          .venv/bin/pyinstaller --onefile --windowed --name "GomokuAI_For_Linux_AMD" main.py
+          ls -lh dist/GomokuAI_For_Linux_AMD
+          file dist/GomokuAI_For_Linux_AMD
 
       - name: Package .deb
         shell: bash
@@ -251,15 +264,25 @@ jobs:
           dpkg-deb -Zgzip --build "${PKG_DIR}" "GomokuAI_For_Linux_AMD.deb"
           ls -lh "GomokuAI_For_Linux_AMD.deb"
 
-      - name: Upload artifact
+      - name: Upload .deb
         uses: actions/upload-artifact@v4
         with:
-          name: GomokuAI_For_Linux_AMD
+          name: GomokuAI_For_Linux_AMD_deb
           path: GomokuAI_For_Linux_AMD.deb
+
+      - name: Upload standalone executable
+        # 注意：artifact 这一趟**不带可执行位**（upload-artifact 只存字节），
+        # 所以用户下到的文件必须自己 `chmod +x`。Release 资产本来也没有权限
+        # 这回事，不用额外处理 —— 只在 README 里说清楚。
+        uses: actions/upload-artifact@v4
+        with:
+          name: GomokuAI_For_Linux_AMD_bin
+          path: dist/GomokuAI_For_Linux_AMD
 
 
   # ============================================================
-  #  Linux ARM64 统一 .pkg — apt PyQt5 (跳过源码编译)
+  #  Linux ARM64 — 免安装裸可执行文件 + .pkg（apt PyQt5，跳过源码编译）
+  #  与 AMD64 那份对称：一份进系统、一份免安装。
   # ============================================================
   build-linux-arm:
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
@@ -292,8 +315,16 @@ jobs:
           .venv/bin/python -c "from PyQt5.QtWidgets import QApplication; print('PyQt5 OK')"
 
       - name: Build (onedir)
+        # .pkg 的原料。
         run: |
           .venv/bin/pyinstaller --onedir --windowed --name "gomoku-ai-arm" main.py
+
+      - name: Build standalone executable (onefile)
+        # 与 AMD64 那份同源同参数，只差架构（runner 就是 arm64）。
+        run: |
+          .venv/bin/pyinstaller --onefile --windowed --name "GomokuAI_For_Linux_ARM" main.py
+          ls -lh dist/GomokuAI_For_Linux_ARM
+          file dist/GomokuAI_For_Linux_ARM
 
       - name: Package .pkg
         run: |
@@ -319,11 +350,17 @@ jobs:
           mv "${PKG_NAME}.tar.gz" "${PKG_NAME}.pkg"
           ls -lh "${PKG_NAME}.pkg"
 
-      - name: Upload artifact
+      - name: Upload .pkg
         uses: actions/upload-artifact@v4
         with:
-          name: GomokuAI_For_Linux_ARM
+          name: GomokuAI_For_Linux_ARM_pkg
           path: GomokuAI_For_Linux_ARM.pkg
+
+      - name: Upload standalone executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: GomokuAI_For_Linux_ARM_bin
+          path: dist/GomokuAI_For_Linux_ARM
 
 
   # ============================================================

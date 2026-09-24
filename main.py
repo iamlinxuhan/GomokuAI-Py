@@ -659,7 +659,7 @@ class SelectionScreen(Screen):
             # 改报思考时限 —— 它是 engine.DIFFICULTY 里真实存在、且用户能直接
             # 感知的量（"AI 要想多久"）。
             for i, (text, tone, secs) in enumerate(
-                    (("初级", "success", "3"), ("中级", "primary", "5"),
+                    (("初级", "success", "3"), ("中级", "primary", "7"),
                      ("高级", "danger", "15"))):
                 # 1/2/3 颗子当强度条 —— 用的是棋盘上那套材质，不是另画一个图标。
                 btn = card_button(text, tone,
