@@ -1,397 +1,501 @@
-# 🎮 五子棋 AI (Gomoku AI)
+# 🎮 Gomoku AI
 
-> **本代码是支持 macOS 的远古版本**，最新 C++ 引擎优化重构版见
-> https://github.com/iamlinxuhan/GomokuAI 。
-> 本旧版仓库已迁至 https://github.com/iamlinxuhan/GomokuAI-Py 。
-> 引擎是纯 Python（不依赖任何平台专属的可执行文件），所以 macOS 上也可以装
-> Python + PyQt5 直接[从源码运行](#运行方式二从源码运行)。Release 里出
-> **macOS arm64 与 Intel 两个架构的 `.dmg` / `.pkg`** —— 首次打开要绕一下
-> Gatekeeper（原因与做法见[下载说明](#运行方式一直接下载-release)）。
+[简体中文](README.zh-CN.md) | **English**
 
-> **本次更新是最后一次更新，从此对本旧版项目停止支持和维护。**
+> **This code is the legacy version, and it is the one that supports macOS.**
+> The latest, optimised and rewritten C++-engine version is at
+> https://github.com/iamlinxuhan/GomokuAI .
+> This legacy repository has moved to https://github.com/iamlinxuhan/GomokuAI-Py .
+> The engine is pure Python (it depends on no platform-specific binary), so on
+> macOS you can install Python + PyQt5 and
+> [run it from source](#option-2-run-from-source). The Release ships
+> **`.dmg` / `.pkg` for both macOS arm64 and Intel** — the first launch needs a
+> small Gatekeeper detour (why and how:
+> [download notes](#option-1-download-a-release)).
 
-基于 **PyQt5** 的五子棋人机对弈程序，AI 引擎为**位棋盘 + 全增量评估 + Negamax/PVS + 置换表 + 静止搜索 + VCF 连续冲四**，纯 CPU 运行。支持三种难度，界面为冷调设计系统配暖木棋盘，右侧面板实时画出 AI 评分与人类胜率曲线。
+> **This update is the last one. Support and maintenance for this legacy
+> project stop here.**
+
+A human-vs-AI Gomoku (five-in-a-row) program built on **PyQt5**. The AI engine is
+**bitboard + fully incremental evaluation + Negamax/PVS + transposition table +
+quiescence search + VCF (continuous forced fours)**, running on CPU only. Three
+difficulty levels; a cool-toned design system around a warm wooden board, with a
+side panel that plots the AI's score and the estimated human win rate live.
 
 ![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.13-blue)
 ![PyQt5](https://img.shields.io/badge/PyQt5-5.x-green)
 ![NumPy](https://img.shields.io/badge/NumPy-✓-orange)
 ![Version](https://img.shields.io/badge/version-2.1.0-brightgreen)
 
-> **v2.0.0 是一次彻底重写**，评估与搜索层整体替换、界面重构为统一设计系统。
-> 旧版的"分层 TSS 威胁响应""多线防守""拼命模式"**已被删除** —— 它们的判断
-> 依据是启发式规则，失败模式是结构性的（详见[为什么删掉威胁响应层](#为什么删掉威胁响应层)）。
-> GPU 加速分支同样删除：它从始至终没有生效过（GPU 检测结果在紧接着的几行被
-> 无条件覆盖回 `'cpu'`），因此引擎现在**只有一条 CPU 路径**，安装包也不再
-> 捆绑 PyTorch/CUDA 运行时。
+> **v2.0.0 was a complete rewrite**: the evaluation and search layers were
+> replaced wholesale and the UI was rebuilt as a unified design system. The old
+> "layered TSS threat response", "multi-line defence" and "desperate mode" have
+> all been **deleted** — their judgements rested on heuristic rules, and their
+> failure mode was structural (see
+> [Why the threat-response layer was deleted](#why-the-threat-response-layer-was-deleted)).
+> The GPU acceleration branch was deleted for the same reason: it never worked
+> from beginning to end (the GPU detection result was unconditionally overwritten
+> back to `'cpu'` a few lines later). The engine therefore has **exactly one CPU
+> path**, and the installers no longer bundle a PyTorch/CUDA runtime.
 
 ---
 
-## ✨ 功能特性
+## ✨ Features
 
-### 🤖 AI 算法
+### 🤖 AI algorithms
 
-| 技术 | 说明 |
+| Technique | Notes |
 |------|------|
-| **位棋盘** | 361 位整数位图 + 全增量状态（候选集/邻居计数/哈希/威胁聚合），`make`/`unmake` 严格对称，支持乱序撤销 |
-| **棋型判定** | 按**集合语义**定义：`F(S) = {空点 e : 在 e 落子即成五}`，`\|F\|≥2` 即活四、`\|F\|=1` 即冲四。数的是成五点的**个数**，不是"活四有几个"这类需要先解释清楚的中间量 |
-| **零和评估** | `evaluate(局面, 黑) == -evaluate(局面, 白)`，增量维护、无不对称系数 |
-| **Negamax + PVS** | Principal Variation Search，零窗口快速剪枝 |
-| **置换表** | 定长数组 + 年龄淘汰；杀棋分按局面归一化存储（存 `value+ply`、取 `value-ply`） |
-| **静止搜索** | 叶节点只搜强制着法，消除"评估被地平线截断"造成的误判 |
-| **VCF 连续冲四** | 专找"每一步都在冲四"的强制序列；**三态返回**（胜 / 无胜 / 算不完），防守侧走 AND 语义。**三档全开** —— 低档的区分度由深度上限承担，不靠让初级失明 |
-| **走法排序** | 历史启发 + 杀手着法 + 成五点优先 |
-| **时间控制** | 硬时间上限 + 迭代加深 + 志向窗口 + 协作式取消（思考中途重开可立即中断） |
-| **确定性开局** | 空盘走天元（不经搜索）；其余一律交给正规搜索 |
+| **Bitboard** | 361-bit integer bitmap + fully incremental state (candidate set / neighbour counts / hash / threat aggregation). `make`/`unmake` are strictly symmetric and support out-of-order undo |
+| **Pattern classification** | Defined by **set semantics**: `F(S) = {empty e : playing at e makes five}`, so `\|F\|≥2` is an open four and `\|F\|=1` is a four. It counts the **number of winning points**, not intermediate notions like "how many open fours" that would first need explaining |
+| **Zero-sum evaluation** | `evaluate(pos, black) == -evaluate(pos, white)`, maintained incrementally, with no asymmetric coefficients |
+| **Negamax + PVS** | Principal Variation Search, fast pruning on zero-window searches |
+| **Transposition table** | Fixed-size array with age-based replacement; mate scores are stored normalised (store `value+ply`, read back `value-ply`) |
+| **Quiescence search** | At leaf nodes, only forced moves are searched, removing misjudgements caused by the evaluation being cut off at the horizon |
+| **VCF (continuous forced fours)** | Searches specifically for forced sequences where "every move is a four"; **three-state return** (win / no win / could not finish), with AND semantics on the defending side. **Enabled on all three levels** — the lower levels are separated by their depth cap, not by making the Novice level blind |
+| **Move ordering** | History heuristic + killer moves + winning-point priority |
+| **Time control** | Hard time limit + iterative deepening + aspiration windows + cooperative cancellation (restarting mid-think interrupts immediately) |
+| **Deterministic opening** | The empty board plays tengen (without searching); everything else goes to a regular search |
 
-### 🎨 UI 设计
+### 🎨 UI design
 
-- **统一设计系统**：颜色/字号/间距/圆角各有单一来源（`theme.py`），全应用共用一套 QSS
-- **冷调科技 + 暖木棋盘**：界面 chrome 走冷青，棋盘保持暖木 —— 棋盘是全局唯一的暖色焦点。木纹程序化生成（保留光泽与明暗梯度），棋子为带镜面高光与接触投影的 sprite
-- **四态齐全的控件**：每个按钮都生成 hover / pressed / focus / **disabled** 四态 —— 旧版零个 `:disabled` 规则，AI 思考期间悔棋按钮外观正常却点不动
-- **坐标与日志同源**：棋盘列标走 `gamelog.col_letter`（跳过 I），与棋谱/日志/题库完全一致
-- **加载界面**：HUD 四角括号 + 木牌标记；如实显示这一屏还要停留多久（约 0.9 秒），不演与真实成本差 43 倍的假进度
-- **最后一手**：与棋子反色的环，黑白子上都清晰
-- **右侧面板**：回合/难度/状态/悔棋次数/步数实时统计，下方两张图表
-  - **AI 评分**（调试用）：每手的分值折线，纵轴对数（symlog），纵轴数量级只增不减 —— 否则轴会随分值回落而收缩，同一条曲线看起来会突然"变陡"。**实心点 = 搜索结果（有深度，是证据），空心点 = 静态估值（没跑搜索时的兜底）**；下方一行等宽读数是搜索参数（深度/节点数/每秒节点数/耗时）
-  - **人类胜率（估计）**：由引擎分值换算的单调曲线，纵轴固定 0–100% **不自适应** —— 曲线活在中间三分之一（活三→冲四只对应 65%→76%），自适应会把它拉得比实际惊险得多。**这是引擎模型下的估计值，不是统计标定的概率**：50% 只是"引擎认为均势"，只有搜索证明的杀棋才显示 100%/0%。折算表见 `analysis.py`，每个拐点都对着 `engine.py` 里的一个分值常量
-- **胜负弹窗**：半透明遮罩 + 再来一局/退出按钮
-- **AI 异步计算**：QThread 线程化，UI 零卡顿
+- **One design system**: colours, font sizes, spacing and corner radii each have
+  a single source of truth (`theme.py`), and the whole app shares one QSS
+- **Cool tech, warm board**: the interface chrome is cool cyan while the board
+  stays warm wood — the board is the only warm focal point in the app. The wood
+  grain is generated procedurally (preserving its gloss and light/dark gradient);
+  stones are sprites with a specular highlight and a contact shadow
+- **Controls with all four states**: every button generates hover / pressed /
+  focus / **disabled** — the old version had not a single `:disabled` rule, so
+  during the AI's think the undo button looked perfectly normal but would not
+  respond to a click
+- **Coordinates and logs from one source**: the board's column labels go through
+  `gamelog.col_letter` (skipping I), exactly matching the game record / logs /
+  position suite
+- **Loading screen**: HUD corner brackets + a wooden plate marker; it honestly
+  shows how much longer this screen will stay (about 0.9 s) rather than faking
+  progress that is off by a factor of 43 from the real cost
+- **Last move**: a ring in the opposite colour to the stone, clear on both black
+  and white
+- **Side panel**: live turn / difficulty / status / undo count / move count,
+  with two charts below
+  - **`AI score`** (for debugging): a line of per-move scores with a logarithmic
+    (symlog) y-axis whose order of magnitude only ever grows — otherwise the axis
+    would contract as scores fall back and the same curve would suddenly look
+    steeper. **A filled dot = a search result (has depth, i.e. evidence); a
+    hollow dot = a static estimate (the fallback when no search was run).** Below
+    it, a monospaced readout shows the search parameters (depth / nodes / nodes
+    per second / elapsed)
+  - **`Human win rate (est.)`**: a monotonic curve converted from the engine's
+    score, on a fixed 0–100% y-axis that does **not** auto-scale — the curve
+    lives in the middle third (a live three → a four is only 65% → 76%), and
+    auto-scaling would stretch it out to look far more dramatic than it is.
+    **This is an estimate under the engine's model, not a statistically
+    calibrated probability**: 50% only means "the engine thinks it is balanced",
+    and 100%/0% appear only for a mate the search has proven. The conversion
+    table is in `analysis.py`, and every knee point lines up with a score
+    constant in `engine.py`
+- **Win/lose dialog**: a translucent overlay with Play again / Quit
+- **Asynchronous AI**: threaded on a QThread, so the UI never stalls
 
 ---
 
-## 📦 快速开始
+## 📦 Getting started
 
-### 运行方式一：直接下载 Release
+### Option 1: download a Release
 
-从 [Releases](https://github.com/iamlinxuhan/GomokuAI-Py/releases) 下载对应平台的安装包，双击即可运行（无需安装 Python）。
+Download the package for your platform from
+[Releases](https://github.com/iamlinxuhan/GomokuAI-Py/releases) and
+double-click (no Python installation needed).
 
-| 平台 | 文件 | 说明 |
+| Platform | File | Notes |
 |---|---|---|
-| Windows | `GomokuAI_Setup_vX.Y.Z.exe` | **安装包**（推荐）：向导安装、自动建开始菜单/桌面快捷方式，可在「添加或删除程序」里卸载 |
-| Windows | `GomokuAI_Portable_vX.Y.Z.exe` | **免安装**：单个 exe，拷到哪都能跑，不写注册表 |
-| Linux amd64 | `GomokuAI_For_Linux_AMD.deb` | **安装包**（推荐）：`sudo dpkg -i`，声明了依赖 |
-| Linux amd64 | `GomokuAI_For_Linux_AMD` | **免安装**：单个可执行文件，`chmod +x` 后直接运行 |
-| Linux arm64 | `GomokuAI_For_Linux_ARM.pkg` | **安装包**：解包后 `sudo ./install.sh` |
-| Linux arm64 | `GomokuAI_For_Linux_ARM` | **免安装**：同上，arm64 架构 |
-| macOS arm64 | `GomokuAI_For_MacOS_ARM.dmg` | **安装包**（推荐）：打开后把「五子棋AI」拖进 Applications，不需要密码 |
-| macOS arm64 | `GomokuAI_For_MacOS_ARM.pkg` | **安装包**：向导安装，装进 `/Applications`，要管理员密码 |
-| macOS Intel | `GomokuAI_For_MacOS_AMD.dmg` | **安装包**（推荐）：同上，x86_64（Intel Mac） |
-| macOS Intel | `GomokuAI_For_MacOS_AMD.pkg` | **安装包**：同上，x86_64（Intel Mac） |
+| Windows | `GomokuAI_Setup_vX.Y.Z.exe` | **Installer** (recommended): a wizard, creates Start-menu / desktop shortcuts, uninstallable from 「Add or remove programs」 |
+| Windows | `GomokuAI_Portable_vX.Y.Z.exe` | **No install**: a single exe, copy it anywhere, writes nothing to the registry |
+| Linux amd64 | `GomokuAI_For_Linux_AMD.deb` | **Installer** (recommended): `sudo dpkg -i`, declares its dependencies |
+| Linux amd64 | `GomokuAI_For_Linux_AMD` | **No install**: a single executable, `chmod +x` and run |
+| Linux arm64 | `GomokuAI_For_Linux_ARM.pkg` | **Installer**: unpack, then `sudo ./install.sh` |
+| Linux arm64 | `GomokuAI_For_Linux_ARM` | **No install**: same, arm64 architecture |
+| macOS arm64 | `GomokuAI_For_MacOS_ARM.dmg` | **Installer** (recommended): open it and drag 「五子棋AI」 into Applications, no password needed |
+| macOS arm64 | `GomokuAI_For_MacOS_ARM.pkg` | **Installer**: a wizard, installs into `/Applications`, needs the admin password |
+| macOS Intel | `GomokuAI_For_MacOS_AMD.dmg` | **Installer** (recommended): same, x86_64 (Intel Mac) |
+| macOS Intel | `GomokuAI_For_MacOS_AMD.pkg` | **Installer**: same, x86_64 (Intel Mac) |
 
-**macOS 上首次打开要绕一下 Gatekeeper。** 本项目的 macOS 产物**没有 Apple 开发者
-签名**（那需要每年 99 美元的开发者账号），而 macOS 对「从网上下载的、未签名」
-的应用一律拦下，报的是「无法打开，因为 Apple 无法检查其是否包含恶意软件」。
-**这不是文件损坏**，放行方式二选一：
+**The first launch on macOS needs a small Gatekeeper detour.** This project's
+macOS artefacts are **not signed with an Apple developer certificate** (that
+needs a $99/year developer account), and macOS blocks any "downloaded, unsigned"
+application outright with 「cannot be opened because Apple cannot check it for
+malicious software」. **This does not mean the file is damaged.** There are two
+ways to let it through:
 
-- **图形界面**（推荐）：先双击一次，让它被拦下 —— 然后打开**系统设置 →
-  隐私与安全性**，往下翻到「安全性」一栏，那里会出现一条关于「五子棋AI」的
-  提示，点**「仍要打开」**并确认。只需做一次，之后双击就正常。
-  ⚠️ 这个按钮**只在被拦下后的大约一小时内出现**，翻不到就再双击一次应用。
-- **命令行**（最快，直接摘掉隔离标记）：
+- **Graphical** (recommended): double-click once and let it be blocked — then
+  open **System Settings → Privacy & Security**, scroll down to the **Security**
+  section, where a notice about 「五子棋AI」 will appear; click **"Open Anyway"**
+  and confirm. You only need to do this once; afterwards double-clicking works.
+  ⚠️ This button **only appears for about an hour after the block**; if you
+  cannot find it, double-click the app again.
+- **Command line** (fastest — it strips the quarantine flag directly):
 
   ```bash
   xattr -dr com.apple.quarantine /Applications/GomokuAI.app
   ```
 
-> **已经不管用的老办法**：网上大量教程仍写着「按住 Control 点图标 → 打开 →
-> 再点一次打开」。那条捷径在 **macOS 15 Sequoia 上被 Apple 移除了**，
-> 现在按它做只会再被拦一次。
+> **An old workaround that no longer works**: plenty of tutorials online still
+> say "Control-click the icon → Open → click Open again". **Apple removed that
+> shortcut in macOS 15 Sequoia**, and following it now just gets you blocked
+> again.
 
-两个架构**都要下自己机器对应的那一份**：Apple Silicon（M 系列）用 `ARM`，
-Intel 用 `AMD`。装错了不会自动回退 —— Intel 那份能在 Apple Silicon 上经
-Rosetta 2 跑（系统会提示装 Rosetta），但反过来不行。
+**Download the one that matches your machine**: Apple Silicon (M-series) takes
+`ARM`, Intel takes `AMD`. Getting it wrong does not fall back automatically — the
+Intel build runs on Apple Silicon through Rosetta 2 (the system will offer to
+install Rosetta), but not the other way round.
 
-**最低系统版本是 macOS 14（Sonoma）**，两个架构都一样。这个数字不是我们定的，
-是 CI 里量出来的（`.app` 内全部二进制里最高的 `minos`）：主程序自己只要 11.0
-（arm64）/ 10.13（Intel），但 numpy 那个 `_multiarray_umath.cpython-311-darwin.so`
-要 14.0 —— pip 在 macOS 15 的构建机上会挑它能跑的最高一档 wheel，而 numpy 有
-`macosx_11_0` 与 `macosx_14_0` 两档。**低版本 macOS 上会直接启动失败**，不会
-优雅降级。
+**The minimum OS version is macOS 14 (Sonoma)**, the same for both architectures.
+That number is not ours to choose — it was measured in CI (the highest `minos`
+across every binary inside the `.app`): the main executable itself only asks for
+11.0 (arm64) / 10.13 (Intel), but numpy's
+`_multiarray_umath.cpython-311-darwin.so` asks for 14.0 — pip on the macOS 15
+build machine picks the highest numpy wheel it can run, and numpy ships both a
+`macosx_11_0` and a `macosx_14_0` variant. **On an older macOS it simply fails to
+launch** — there is no graceful degradation.
 
-**统一版本**：都是**纯 CPU 运行，不需要显卡驱动，也不需要安装 PyTorch/CUDA**。
+**The same across the board**: everything is **CPU-only, needs no graphics
+driver, and needs no PyTorch/CUDA install**.
 
-**免安装的那几份不声明依赖。** 系统里缺 `libgl1` / xcb 那几个库、或者一个中文字体
-都没有时，它们不会替你装 —— 只会启动失败或满屏方框。`.deb` / `.pkg` 会把这些
-一起装上（含 CJK 字体候选链），所以**不确定装哪个就用安装包**。
+**The no-install builds declare no dependencies.** If the system is missing
+`libgl1` / the xcb libraries, or has no CJK font at all, they will not install
+them for you — they will just fail to start or show a screen full of boxes. The
+`.deb` / `.pkg` pull those in (including a CJK font candidate chain), so **if you
+are unsure, take the installer**.
 
-Linux 的免安装版是**裸可执行文件，没有扩展名**，下载后要先给可执行位：
+The Linux no-install builds are **bare executables with no extension**, so set
+the executable bit after downloading:
 
 ```bash
 chmod +x GomokuAI_For_Linux_AMD
 ./GomokuAI_For_Linux_AMD
 ```
 
-（Release 资产不携带文件权限，这一步谁都替不了你。）
+(Release assets do not carry file permissions; nobody can do this step for you.)
 
-### 运行方式二：从源码运行
+### Option 2: run from source
 
 ```bash
-# 1. 克隆仓库
+# 1. Clone the repository
 git clone https://github.com/iamlinxuhan/GomokuAI-Py.git
 cd GomokuAI-Py
 
-# 2. 安装依赖（Python >= 3.11）
+# 2. Install dependencies (Python >= 3.11)
 pip install -r requirements.txt
 
-# 3. 运行
+# 3. Run
 python main.py
 ```
 
 ---
 
-## 🎯 游戏规则
+## 🎯 Rules
 
-1. 标准五子棋规则，19×19 棋盘
-2. 黑棋先手，任意一方在 横/纵/斜 方向 **先连成五子** 者获胜
-3. 双方交替落子，不可重复落子
+1. Standard Gomoku rules, 19×19 board
+2. Black moves first; whoever first gets **five in a row** horizontally,
+   vertically or diagonally wins
+3. Players alternate, and a point cannot be played twice
 
 ---
 
-## 🎛️ 难度说明
+## 🎛️ Difficulty
 
-三档参数就是 `engine.py` 的 `DIFFICULTY`，单位与数值可直接对照：
+The three parameter sets are exactly `DIFFICULTY` in `engine.py`; units and
+values can be compared directly:
 
-| 难度 | 每步时限 | 深度上限 | 静止搜索层数 | VCF 预算 |
+| Level | Time per move | Depth cap | Quiescence plies | VCF budget |
 |------|---------|---------|------------|---------|
-| **初级** | 3 s | 4 | 4 | 0.3 s |
-| **中级** | 7 s | 10 | 8 | 0.5 s |
-| **高级** | 15 s | 24 | 10 | 1.5 s |
+| **Novice** | 3 s | 4 | 4 | 0.3 s |
+| **Intermediate** | 7 s | 10 | 8 | 0.5 s |
+| **Advanced** | 15 s | 24 | 10 | 1.5 s |
 
-三点需要说清：
+Three things need saying clearly:
 
-- **"深度上限"是上限，不是承诺。** 实际到达的层数由迭代加深在时限内决定 ——
-  开局几手会说走就走（评估认为无可搜之物），中盘才会走满时限。
-- **VCF 的时间算在上述时限之内**，不是额外开销。
-- **三档都开 VCF。** 初级档曾经关掉它，那是个错误：关掉之后初级既算不出
-  自己的冲四链，也看不见对手的 —— 那不是"难度低"，是**失明**。真实败局
-  里人类用一条 11 手 VCF 链取胜，而初级全程没有任何机制能看见它（那个关键
-  盘面固化在 `tests/test_difficulty.py` 的 `LOST_183202_P28`）。现在低档的
-  区分度由**深度上限**承担，不靠缺失子系统。
+- **"Depth cap" is a cap, not a promise.** The depth actually reached is decided
+  by iterative deepening within the time limit — the first few opening moves come
+  back immediately (the evaluation finds nothing worth searching), and only the
+  midgame runs out the clock.
+- **VCF time counts inside that limit**, not as extra overhead.
+- **All three levels have VCF on.** The Novice level once had it off, and that
+  was a mistake: with it off, Novice could neither work out its own chains of
+  fours nor see the opponent's — that is not "a lower difficulty", that is
+  **blindness**. In a real lost game the human won with an 11-move VCF chain, and
+  Novice had no mechanism at all that could see it (that key position is pinned
+  in `tests/test_difficulty.py` as `LOST_183202_P28`). The lower levels are now
+  separated by **depth cap**, not by a missing subsystem.
 
-**中级的 7 秒是被一个具体局面定出来的，不是拍的。** 那局
-（`game_log_20260922_235240`，中级执白、人类第 31 手 J8 胜）的胜负手在第 4 手：
-盘面只有三颗子时，**第 4 层选 K9，第 5 层选 K7/K11** —— 相邻两层给出胜负相反
-的结论。把这一手钉死、其余着法仍用旧预算重放
-（`python tools/pivot_ab.py --budget 5.0`）：走 K9 得到**黑胜 · 第 31 手 J8**，
-而且与日志**逐手相同 —— 31 手一手不差**；走 K7 或 K11 则是白方第 12 / 18 手
-反杀。这一手就是那盘棋的全部，后面 27 手都只是症状。
+**Intermediate's 7 seconds was set by one specific position, not guessed.** That
+game (`game_log_20260922_235240`, Intermediate playing white, human winning on
+move 31 at J8) was decided on move 4: with only three stones on the board,
+**ply 4 picks K9 while ply 5 picks K7/K11** — adjacent plies reaching opposite
+conclusions. Pinning that move and replaying the rest with the old budget
+(`python tools/pivot_ab.py --budget 5.0`): K9 gives
+**black wins · move 31 J8**, and **matches the log move for move — all 31 moves
+identical**; K7 or K11 gives white a counter-win on move 12 / 18. That one move
+is the whole game; the 27 moves after it are just symptoms.
 
-**旧预算的问题不是"差一点深度"，是压在临界点上。** 同一份输入、同一个 5.0 s
-预算，重复搜这一手会给出**两种答案**：
+**The problem with the old budget was not "slightly too shallow" — it sat right
+on the tipping point.** With the same input and the same 5.0 s budget, repeating
+the search for that move gives **two different answers**:
 
-| `time` | 预算 | 第 4 手实测 |
+| `time` | Budget | Move 4, measured |
 |---|---|---|
-| 5.0（旧值） | 4250 ms | K7·5 层 与 **K9·4 层** 交替出现 —— 分三批测出 3/12、0/8，**负载下 4/4** |
-| 6.0 | 5100 ms | K7 · 5 层，5/5 稳定 |
-| **7.0** | 5950 ms | K7 · 5 层 · val −170，4/4 稳定 |
+| 5.0 (old value) | 4250 ms | K7 · ply 5 and **K9 · ply 4** alternate — across three batches, 3/12 and 0/8, and **4/4 under load** |
+| 6.0 | 5100 ms | K7 · ply 5, stable at 5/5 |
+| **7.0** | 5950 ms | K7 · ply 5 · val −170, stable at 4/4 |
 
-第三列里 5.0 那一行的**三批数字本身就是结论**：比例随机器当时多忙而变 ——
-起 6 个满载进程后 4/4 全走败着。也就是说在稍忙的机器上，中级档一开局就固定
-下出那盘败局。7.0 相对实测的第一稳定点 6.0 留了约 0.85 s，这是取 7.0 而不是
-6.0 的理由。
+**The three batches in the 5.0 row are themselves the conclusion**: the ratio
+varies with how busy the machine is — with 6 saturated processes running, 4/4
+played the losing move. So on a slightly busy machine, Intermediate
+deterministically plays that losing game from the very opening. 7.0 leaves about
+0.85 s over the first stable point measured at 6.0, which is why it is 7.0
+rather than 6.0.
 
-量它的办法是 `python tools/pivot_ab.py --budget 5.0 --stability N`：**空载时
-多半只看到 K7**，想把败着逼出来，得让机器忙起来再跑同一个命令。
+The way to measure it is
+`python tools/pivot_ab.py --budget 5.0 --stability N`: **when idle you will
+mostly see only K7** — to coax the losing move out, you have to make the machine
+busy and run the same command again.
 
-**这是把地平线推远，不是治好了。** 任何固定预算都有地平线 —— 下一个局面总会
-有需要更深一层才看得见的棋。这条时限只保证"这一个局面看得见"，而且它是**对着
-一条人类着法线**定的：换成同级引擎对手，白方并不因此就必胜。
+**This pushes the horizon farther out; it does not cure anything.** Any fixed
+budget has a horizon — the next position will always have a move that needs one
+more ply to see. This time limit only guarantees "this one position is visible",
+and it was set **against one human line of play**: against an engine opponent at
+the same level, white does not thereby win.
 
-**代价要如实说**：低档之间在**开阔中盘**仍会到达相近的深度，而阶梯的真正
-分野是 `max_depth` 4/10/24 —— 要在窄树上才拉得开。
+**The cost has to be stated honestly**: on **open midgames** the lower levels
+still reach similar depths. The real separation in the staircase is `max_depth`
+4/10/24 — it only spreads out on narrow trees.
 
-实测（`python tools/bench.py --engine engine --level N`，5 个固定局面）。
-注意"深度上限"是配置值、"深度中位"是实际到达值，两者不是一回事：
+Measured (`python tools/bench.py --engine engine --level N`, 5 fixed positions).
+Note that "depth cap" is the configured value while "median depth" is what was
+actually reached — they are not the same thing:
 
-| 档 | 墙钟中位 / 最大 | 深度中位 / 最大 | nps 中位 | 时间合规 |
+| Level | Wall clock median / max | Depth median / max | nps median | Time compliant |
 |---|---|---|---|---|
-| 初级 | 718 ms / 2552 ms | 4 / 4 | 54,155 | 5/5 |
-| 中级 | 5956 ms / 5978 ms | 4 / 4 | 50,700 | 5/5 |
-| 高级 | 12 769 ms / 12 789 ms | 5 / 5 | 48,873 | 5/5 |
+| Novice | 718 ms / 2552 ms | 4 / 4 | 54,155 | 5/5 |
+| Intermediate | 5956 ms / 5978 ms | 4 / 4 | 50,700 | 5/5 |
+| Advanced | 12 769 ms / 12 789 ms | 5 / 5 | 48,873 | 5/5 |
 
-（2026-09-23 实测。三档的深度**最小**值都是 1，那是 `mid_10stones` —— 一个
-已被判定的局面，迭代加深在找到杀棋后立刻收敛，深度低是因为它没什么可搜的。）
+(Measured 2026-09-23. The **minimum** depth across the three levels is 1 in every
+case, and that is `mid_10stones` — a position that has already been decided,
+where iterative deepening converges immediately on finding the mate; the depth is
+low because there is nothing to search.)
 
-注意中级这一行：**这 5 个局面里中级仍然只到第 4 层**（它们不是上面那个第 4 手
-的局面），所以中级的 7 秒在这里表现为"走满时间、深度不变"。深度门槛跟局面走，
-不跟档位走。
+Look at the Intermediate row: **on these 5 positions it still only reaches ply
+4** (they are not that move-4 position from above), so Intermediate's 7 seconds
+shows up here as "runs out the clock, depth unchanged". The depth threshold
+follows the position, not the level.
 
-**这张表读的是"这 5 个局面有多快解决"，不是"引擎总是这么快"。** 它们里
-好几个是**已经被判定的局面** —— 例如 `mid_10stones` 的轮走方已经必败
-（对手有 VCF 杀，`best_val = -(WIN_SCORE-1)`，即下一手就成五），
-`mid_clash` 则是轮走方 6 手内必胜。这类局面本就该秒回，深度自然低。
-真实的硬中局会走满整段时间预算 —— 那才是时限存在的意义。
-上表"时间合规"一列是"没超"，不是"用满了"。
+**This table reads "how quickly these 5 positions resolve", not "the engine is
+always this fast".** Several of them are **already-decided positions** — for
+example, the side to move in `mid_10stones` has already lost (the opponent has a
+VCF mate, `best_val = -(WIN_SCORE-1)`, i.e. five next move), and `mid_clash` is a
+win in 6 for the side to move. Positions like these should return instantly, and
+their depth is naturally low. A real, hard midgame will run out the whole time
+budget — that is what the limit is for. The "time compliant" column above means
+"did not exceed", not "used it all".
 
-**深度 4-5 是这套设计的能力上限，不是回归。** 它是全宽 PVS + 置换表 +
-静止搜索 + VCF，**没有任何现代裁剪**（LMR / 空着裁剪 / 无用着裁剪），
-实测每层有效分支因子约 20。13 秒约 65 万节点要搜到 10 层，需要把分支
-因子压到 3.7 附近 —— 门槛因此从 `≥10` 修正为 `≥5`。
-
----
-
-## 🧠 引擎设计
-
-### 杀棋分与静态分分带
-
-静态分钳在 ±`STATIC_MAX`，杀棋分在 `WIN_SCORE - MAX_PLY` 以上，中间留 128
-的真空带 —— 因此"这是必杀"与"这个局面看起来不错"在数值上不会混淆，
-`is_mate()` 的判定是可靠的而非推测。
-
-对照旧引擎在同一套基准上的 `mid_10stones`：**8149.8 ms 只到第 5 层**
-（`tools/BASELINE.md`），而新引擎 3.5 ms 就到第 1 层 —— 两者都认得出这是
-个必败局面，旧引擎报 `-10000003`，新引擎报 `-(WIN_SCORE-1)`。
-
-差别的关键不在快慢，而在**这个数字能不能被读懂**：旧引擎的将杀分
-（`-10000000 - depth`）与它自己的复合静态分**量程重叠** —— 拼命模式的
-攻防加权可以到 ±3.45e7，比将杀分还大。于是"我三步后必死"与"这局面挺
-糟糕"在数值上分不开，界面看到的只是一个很大的负数。
-
-### 时间是硬上限，深度上限是安全阀
-
-`think` 收下难度档位后设一个**硬**截止（`t0 + time × 0.85`，留 15% 余量
-给回传与 UI），迭代加深在这个截止前能跑多深就跑多深，`max_depth` 只是
-防止"看起来安静、实际到处是四"的中局把低档也拖到 20 层。
-
-**安全阀必须真的成为约束。** 初级档曾经不是：它的 1.275 秒只够第 3 层，
-而在真实败局的那个中局上，第 3 层给出的判断与第 4 层**方向相反** ——
-第 3 层报 -560（"略处下风"），第 4 层报 -698910（"已经快死了"），而第 4 层
-需要 1.55 秒。`tests/test_difficulty.py::test_low_level_reaches_its_own_depth_cap`
-现在钉着这条：低档的时间必须够它跑到自己的上限。
-
-### 为什么删掉威胁响应层
-
-旧版在搜索之前有一层约 130 行的 `_check_immediate_threat`，用七段启发式
-规则抢答"现在该走哪"。它的失败方式是结构性的：**启发式判对时省下的时间，
-远小于判错时输掉的棋。**
-
-最典型的一处判据写成 `opp_win >= 2 or opp_live4 >= 2`，而实战里最常见的
-双杀形态是 `opp_win == 1 且 opp_live4 >= 1` —— **恰好落在判据之外**。
-补丁是加一条规则，而规则永远补不完；真正的问题是"用有限条规则去近似一个
-可以精确判定的问题"。
-
-新引擎把它拆给两个**能给出确定性结论**的机制：静止搜索数成五点的个数
-（精确），VCF 负责更长的强制序列（同样精确，且能明确区分"没有杀"与
-"我没算完"）。`tests/test_threat.py` 断言的正是"**这些名字不该再存在**"——
-它们当年处理的局面必须仍然被正确处理，但不能再靠启发式。
+**Depth 4–5 is the ceiling of this design, not a regression.** It is full-width
+PVS + transposition table + quiescence search + VCF, **with no modern pruning at
+all** (no LMR / null-move / futility pruning), and the measured effective
+branching factor is around 20 per ply. To reach ply 10 in ~650k nodes in 13
+seconds you would need to squeeze the branching factor down to about 3.7 — hence
+the threshold was corrected from `≥10` to `≥5`.
 
 ---
 
-## 📁 项目结构
+## 🧠 Engine design
+
+### Mate scores and static scores are banded apart
+
+Static scores are clamped to ±`STATIC_MAX`, mate scores start above
+`WIN_SCORE - MAX_PLY`, and a vacuum band of 128 sits between them — so "this is
+a forced mate" and "this position looks good" cannot be confused numerically, and
+`is_mate()`'s verdict is reliable rather than a guess.
+
+Compare the old engine on `mid_10stones` with the same benchmark:
+**8149.8 ms only reaches ply 5** (`tools/BASELINE.md`), whereas the new engine
+reaches ply 1 in 3.5 ms — both recognise this as a lost position, the old engine
+reporting `-10000003` and the new one `-(WIN_SCORE-1)`.
+
+The key difference is not speed but **whether that number can be read**: the old
+engine's mate score (`-10000000 - depth`) **overlapped in range** with its own
+composite static score — the attack/defence weighting of "desperate mode" could
+reach ±3.45e7, larger than the mate score. So "I am dead in three moves" and
+"this position is pretty bad" were numerically indistinguishable, and the UI just
+saw a large negative number.
+
+### Time is the hard limit; the depth cap is a safety valve
+
+After taking the level, `think` sets a **hard** deadline (`t0 + time × 0.85`,
+keeping 15% for the return trip and the UI); iterative deepening goes as deep as
+it can before that deadline, and `max_depth` exists only to stop a midgame that
+"looks quiet but is full of fours everywhere" from dragging even the low levels
+to 20 plies.
+
+**The safety valve has to actually constrain.** The Novice level once did not:
+its 1.275 seconds only stretched to ply 3, and on the midgame from that real lost
+game, ply 3 and ply 4 gave **opposite** verdicts — ply 3 reported −560
+("slightly behind"), ply 4 reported −698910 ("nearly dead"), and ply 4 needed
+1.55 seconds. `tests/test_difficulty.py::test_low_level_reaches_its_own_depth_cap`
+now pins this down: a low level's time must be enough for it to reach its own cap.
+
+### Why the threat-response layer was deleted
+
+The old version had a roughly 130-line `_check_immediate_threat` layer before
+the search, using seven heuristic rules to answer "what should I play now?" Its
+failure mode was structural: **the time saved when the heuristic is right is far
+smaller than the game lost when it is wrong.**
+
+The most typical criterion read `opp_win >= 2 or opp_live4 >= 2`, whereas the
+most common double-threat shape in real play is `opp_win == 1 and opp_live4 >= 1`
+— **which falls exactly outside it**.
+
+The patch was to add a rule, and rules can never be finished; the real problem is
+"approximating a decidable problem with a finite set of rules". The new engine
+splits it into two mechanisms that give deterministic verdicts: quiescence search
+counts the number of winning points (exact), and VCF handles longer forced
+sequences (equally exact, and able to distinguish clearly between "there is no
+mate" and "I could not finish"). `tests/test_threat.py` asserts precisely that
+"**these names should no longer exist**" — the positions they used to handle must
+still be handled correctly, but no longer by heuristic.
+
+---
+
+## 📁 Project layout
 
 ```
 GomokuAI/
-├── main.py            # 界面组装 + 游戏流程接线（不含搜索/评估逻辑）
-├── engine.py          # AI 引擎：位棋盘 / 评估 / 搜索 / VCF（零 Qt，仅依赖 numpy，可脱离界面单测）
-├── analysis.py        # 分值 -> 胜率的折算、symlog 映射、读数格式化（纯函数，零 Qt）
-├── charts.py          # 面板上的两张自绘图表（折线 / 网格 / 标记点）
-├── gamelog.py         # 对局日志与棋谱坐标格式
-├── theme.py           # 设计系统：调色板 / 字号 / 间距 / 圆角 / QSS 生成
-├── ui_kit.py          # 可复用控件原语（标题、信息行、按钮、页面骨架、科技底纹）
-├── board_geometry.py  # 像素 <-> 格子换算（纯 math，零 Qt）
-├── board_render.py    # 棋盘离屏渲染（木纹 / 棋子 sprite / 图层缓存）
-├── tests/             # pytest：几何、增量引擎、题库、胜率折算、颜色字面量守卫
+├── main.py            # UI assembly + game-flow wiring (no search/eval logic)
+├── engine.py          # the AI engine: bitboard / eval / search / VCF (zero Qt, numpy only, unit-testable standalone)
+├── analysis.py        # score -> win-rate conversion, symlog mapping, readout formatting (pure functions, no Qt)
+├── charts.py          # the two self-drawn charts on the panel (line / grid / markers)
+├── gamelog.py         # game logs and board-coordinate format
+├── theme.py           # design system: palette / font sizes / spacing / radii / QSS generation
+├── ui_kit.py          # reusable widget primitives (titles, info rows, buttons, page skeleton, tech texture)
+├── board_geometry.py  # pixel <-> cell conversion (pure math, no Qt)
+├── board_render.py    # offscreen board rendering (wood grain / stone sprites / layer cache)
+├── tests/             # pytest: geometry, incremental engine, position suite, win-rate conversion, colour-literal guard
 ├── tools/
-│   ├── BASELINE.md    # 各阶段实测基线与门槛（含已作废数字的标注）
-│   ├── bench.py       # 基准测试        selfplay.py  # 自对弈 A/B 胜率
-│   ├── positions.py   # 局面题库        analyze_log.py  # 复盘对局日志
-│   ├── gui_smoke.py   # 无头界面冒烟    ui_snapshot.py  # 离屏抓图
-│   └── legacy_engine.py  # 旧引擎逐字快照（不得修改，作为 A/B 对照组）
+│   ├── BASELINE.md    # measured baselines and thresholds per stage (with withdrawn numbers marked)
+│   ├── bench.py       # benchmark         selfplay.py  # self-play A/B win rate
+│   ├── positions.py   # position suite    analyze_log.py  # replay a game log
+│   ├── gui_smoke.py   # headless UI smoke test    ui_snapshot.py  # offscreen screenshots
+│   └── legacy_engine.py  # verbatim snapshot of the old engine (must not be modified; the A/B control)
 ├── installer/
-│   └── GomokuAI.iss   # Windows 安装包脚本（Inno Setup，**UTF-8 带 BOM**，见「打包」）
-├── requirements.txt      # 运行时依赖（numpy / PyQt5）
-├── requirements-dev.txt  # 开发与打包依赖（含 pytest / pyinstaller）
-├── input.png          # 设计参考图（棋盘配色的取样来源，**运行时不读取**）
-├── 五子棋.ico          # 程序图标（Windows 直接用；macOS 打包时转成 .icns）
+│   └── GomokuAI.iss   # Windows installer script (Inno Setup, **UTF-8 with BOM**, see "Packaging")
+├── requirements.txt      # runtime dependencies (numpy / PyQt5)
+├── requirements-dev.txt  # development and packaging dependencies (incl. pytest / pyinstaller)
+├── input.png          # design reference image (the source the board colours were sampled from; **never read at runtime**)
+├── 五子棋.ico          # application icon (used directly on Windows; converted to .icns when packaging for macOS)
 └── README.md
 ```
 
 ---
 
-## 🛠️ 打包（Windows / Linux / macOS）
+## 🛠️ Packaging (Windows / Linux / macOS)
 
-两边都是**两份产物**：一份装进系统，一份免安装。CI 上就是这样，本地照做即可。
+Every platform produces **two artefacts**: one that installs into the system and
+one that runs without installing. That is what CI does; locally, do the same.
 
 ### Windows
 
 ```bash
-# 安装依赖（打包工具含在开发依赖里）
+# Install dependencies (the packaging tools are in the dev requirements)
 pip install -r requirements-dev.txt
 
-# ① 安装包的原料：onedir
+# (1) The input to the installer: onedir
 pyinstaller --onedir --windowed --icon="五子棋.ico" --name "GomokuAI" main.py
 
-# ② 免安装单文件版：onefile（与 ① 用不同的 --name，见下）
+# (2) The no-install single file: onefile (use a different --name from (1), see below)
 pyinstaller --onefile --windowed --icon="五子棋.ico" --name "GomokuAI_Portable" main.py
 ```
 
-**为什么是两份而不是一份。** `--onedir` 启动快（运行时就在旁边，直接加载），
-但整个目录几百个文件，不给用户一个安装向导就没法交付；`--onefile` 是单个
-文件、拷走就能跑，代价是**每次启动**都要先把内置的运行时解包到临时目录，
-PyQt5 程序的首次窗口会明显慢一拍。所以：装到硬盘上的那份用 onedir 做成安装
-包，需要"拷到 U 盘/别人机器上就跑"的那份用 onefile。
+**Why two instead of one.** `--onedir` starts fast (the runtime sits right beside
+it and is loaded directly), but the directory holds hundreds of files, so it
+cannot be handed to a user without an installer wizard; `--onefile` is a single
+file that runs after being copied anywhere, at the cost of unpacking the bundled
+runtime to a temp directory **on every launch** — a PyQt5 program's first window
+is noticeably slower. So: the copy that lives on the disk is built with onedir
+into an installer, and the copy that needs to "run off a USB stick or someone
+else's machine" is built with onefile.
 
-**两次构建必须用不同的 `--name`。** 否则它们共用 `build/` 与 `dist/` 下的
-同名中间目录，第二次构建会捡起第一次的缓存，产物里混进不该有的东西。
+**The two builds must use different `--name`s.** Otherwise they share the
+same-named intermediate directories under `build/` and `dist/`, and the second
+build picks up the first one's cache — mixing things into the artefact that
+should not be there.
 
-### 安装包（Inno Setup）
+### The installer (Inno Setup)
 
-`installer/GomokuAI.iss` 把 ① 的产物打成带向导的安装程序：
+`installer/GomokuAI.iss` wraps the output of (1) into a wizard-based installer:
 
 ```bash
-# 装编译器（本地；CI 上是 choco install innosetup）
+# Install the compiler (locally; in CI it is choco install innosetup)
 winget install JRSoftware.InnoSetup
 
-# 编译（AppVersion 通常由 CI 从 tag 传入）
+# Compile (AppVersion is usually passed in by CI from the tag)
 & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=2.1.0 installer\GomokuAI.iss
 ```
 
-输出到 `dist-installer/GomokuAI_Setup_v<版本>.exe`。它装进
-`%LOCALAPPDATA%\GomokuAI`（不需要管理员权限，不弹 UAC），并在「添加或删除
-程序」里登记卸载项 —— 这两点正是旧的 7z + `install.bat` 方案做不到的。
+The output goes to `dist-installer/GomokuAI_Setup_v<version>.exe`. It installs
+into `%LOCALAPPDATA%\GomokuAI` (no admin rights, no UAC prompt) and registers an
+uninstall entry in 「Add or remove programs」 — exactly the two things the old
+7z + `install.bat` scheme could not do.
 
-两个容易踩的坑，都写在 `.iss` 里了：
+Two easy traps, both documented in the `.iss`:
 
-- **这个文件必须存为「UTF-8 带 BOM」。** 里面有中文（应用名、图标路径）；
-  没有 BOM 时 ISCC 会按 ANSI 解析，中文变乱码。改这个文件时别让编辑器把
-  BOM 吃掉。
-- **中文界面只在编译器自带 `Languages\ChineseSimplified.isl` 时才挂上。**
-  Inno Setup 从 6.3 起才官方收录简体中文，而 `MessagesFile` 指向不存在的
-  文件是编译期硬错。CI 探测到才传 `/DHasChinese=1` —— 用编译器自带的那份
-  而不是把 `.isl` 收进仓库，语言文件与编译器就永远同源、不会版本错配。
+- **This file must be saved as "UTF-8 with BOM".** It contains Chinese (the app
+  name, the icon path); without a BOM, ISCC parses it as ANSI and the Chinese
+  turns into mojibake. When editing this file, don't let the editor eat the BOM.
+- **The Chinese interface only loads when the compiler ships
+  `Languages\ChineseSimplified.isl`.** Inno Setup only officially includes
+  Simplified Chinese from 6.3 onwards, and a `MessagesFile` pointing at a
+  nonexistent file is a hard compile-time error. CI passes `/DHasChinese=1` only
+  when it detects it — using the compiler's own copy rather than vendoring the
+  `.isl` into the repository keeps the language file and the compiler forever
+  from the same source, with no version mismatch.
 
-不再需要任何 torch 排除参数：依赖里已经没有它了。旧版为了把 CUDA 运行时塞进
-包里，要先腾磁盘、再拆成两个包才不超 GitHub 的 2GB 上限；现在只剩 numpy 与
-PyQt5。
+No torch exclusion flags are needed any more: it is no longer a dependency. The
+old version had to free up disk space and then split into two packages just to
+fit the CUDA runtime inside GitHub's 2GB limit; now only numpy and PyQt5 remain.
 
 ### Linux
 
 ```bash
-# ① 安装包的原料：onedir
-pyinstaller --onedir --windowed --name "gomoku-ai" main.py     # arm64 用 gomoku-ai-arm
+# (1) The input to the installer: onedir
+pyinstaller --onedir --windowed --name "gomoku-ai" main.py     # use gomoku-ai-arm for arm64
 
-# ② 免安装可执行文件：onefile
+# (2) The no-install executable: onefile
 pyinstaller --onefile --windowed --name "GomokuAI_For_Linux_AMD" main.py
 ```
 
-② 出来的 `dist/GomokuAI_For_Linux_AMD` 就是 Release 上那份**裸可执行文件**
-（无扩展名），`chmod +x` 后直接运行。① 那份分别由 `.deb`（`dpkg-deb`）和
-`.pkg`（`tar` + `install.sh`）收进系统，脚本都在 CI 里，见
-[build.yml](.github/workflows/build.yml)。
+The `dist/GomokuAI_For_Linux_AMD` from (2) is the **bare executable** on the
+Release (no extension) — `chmod +x` and run. The output of (1) is installed into
+the system by `.deb` (`dpkg-deb`) and `.pkg` (`tar` + `install.sh`)
+respectively; both scripts live in CI, see
+[build.yml](.github/workflows/build.yml).
 
-**Linux 的 onefile 有两个 Windows 上没有的注意点**：
+**Linux's onefile has two caveats Windows does not**:
 
-- **它声明不了依赖。** `.deb` 能在 `Depends:` 里列出 `libgl1`、xcb 那几个库和
-  CJK 字体候选链，裸文件不能 —— 缺什么就报什么（或者满屏方框）。这是它必须
-  和 `.deb` 并存、而不是取代 `.deb` 的原因。
-- **可执行位不在文件里。** Release 资产只存字节，用户下到的文件是 `0644`，
-  必须自己 `chmod +x`。artifact 那一趟（`upload-artifact`）同样不保留权限。
-  CI 不做任何补偿 —— 补偿不了，只能在 README 里写清楚。
+- **It cannot declare dependencies.** A `.deb` can list `libgl1`, the xcb
+  libraries and a CJK font candidate chain in `Depends:`; a bare file cannot — it
+  reports whatever is missing (or shows a screen full of boxes). This is why it
+  has to coexist with the `.deb` rather than replace it.
+- **The executable bit is not in the file.** Release assets store bytes only, so
+  what the user downloads is `0644` and they must `chmod +x` it themselves. The
+  artifact leg (`upload-artifact`) does not preserve permissions either. CI does
+  not compensate in any way — it cannot; the only thing to do is say so clearly
+  in the README.
 
 ### macOS
 
 ```bash
-# ① 先把 Windows 那个 .ico 转成 .icns（macOS 只认 .icns）
+# (1) First convert the Windows .ico into .icns (macOS only understands .icns)
 python -c "from PIL import Image; import glob, os; \
 src = Image.open(glob.glob('*.ico')[0]).convert('RGBA'); \
 os.makedirs('AppIcon.iconset', exist_ok=True); \
@@ -403,11 +507,11 @@ os.makedirs('AppIcon.iconset', exist_ok=True); \
               (512,'icon_512x512.png'), (1024,'icon_512x512@2x.png')]]"
 iconutil -c icns AppIcon.iconset -o AppIcon.icns
 
-# ② .app
+# (2) The .app
 pyinstaller --windowed --name "GomokuAI" \
   --osx-bundle-identifier com.iamlinxuhan.gomokuai --icon AppIcon.icns main.py
 
-# ③ 换成中文显示名，然后**重签**（改 Info.plist 会让上一步的签名失效）
+# (3) Switch to the Chinese display name, then **re-sign** (editing Info.plist invalidates the signature from the previous step)
 /usr/libexec/PlistBuddy -c "Set :CFBundleName 五子棋AI" \
   dist/GomokuAI.app/Contents/Info.plist
 /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 五子棋AI" \
@@ -415,88 +519,109 @@ pyinstaller --windowed --name "GomokuAI" \
 codesign --force --deep --sign - dist/GomokuAI.app
 ```
 
-③ 出来的 `dist/GomokuAI.app` 再由 `hdiutil`（`.dmg`）和 `pkgbuild`（`.pkg`）
-收成 Release 上那两种包，脚本都在 CI 里。
+The `dist/GomokuAI.app` from (3) is then wrapped by `hdiutil` (`.dmg`) and
+`pkgbuild` (`.pkg`) into the two package types on the Release; both scripts live
+in CI.
 
-**两个架构是各自原生构建的，不是 universal2。** PyInstaller 要把 PyQt5 的 Qt
-动态库一并收进 `.app`，而 universal2 要求包里每一个 Mach-O 都是 fat 的 ——
-PyQt5-Qt5 的 wheel 只有 `macosx_11_0_arm64` 与 `macosx_10_13_x86_64` 两份，
-拼不出一个双架构的 Qt。硬做只会得到一个「有一半架构起不来」的 `.app`。CI 里
-`macos-15`（arm64）与 `macos-15-intel`（x86_64）各跑一遍，并且**先断言
-`platform.machine()` 与标签一致**：产物自己不自证架构，标签被悄悄改指是查不
-出来的。
+**The two architectures are each built natively, not as universal2.** PyInstaller
+bundles PyQt5's Qt dynamic libraries into the `.app`, and universal2 requires
+every Mach-O in the bundle to be fat — but the PyQt5-Qt5 wheel ships only
+`macosx_11_0_arm64` and `macosx_10_13_x86_64`, so a dual-architecture Qt cannot
+be assembled. Forcing it only yields an `.app` where one half of the
+architectures will not start. CI runs `macos-15` (arm64) and `macos-15-intel`
+(x86_64) once each, and **first asserts that `platform.machine()` matches the
+label**: an artefact does not prove its own architecture, and a label quietly
+repointed cannot be detected afterwards.
 
-**没有代码签名。** 需要 Apple 开发者账号（每年 99 美元），本项目没有，只做了
-ad-hoc 签名（`codesign -s -`）。后果就是用户首次打开要绕一下 Gatekeeper，
-做法写在[下载说明](#运行方式一直接下载-release)里。
+**There is no code signature.** That needs an Apple developer account ($99/year),
+which this project does not have; only an ad-hoc signature (`codesign -s -`) is
+applied. The consequence is that the user's first launch needs a Gatekeeper
+detour, described in the
+[download notes](#option-1-download-a-release).
 
-**最低系统版本由构建机决定，不由我们决定。** 实测两个架构的产物都是
-**macOS 14**：主程序自己是 11.0 / 10.13，但 numpy 的
-`_multiarray_umath.cpython-311-darwin.so` 要 14.0 —— pip 在 macOS 15 的
-runner 上会挑它能跑的最高一档 numpy wheel（`macosx_14_0`），而不是最兼容的
-那一档（`macosx_11_0`）。CI 里那一步 `Report the minimum macOS version the
-.app requires` 就是把这个数打出来用的：**它是事实，不是不变量**，换 runner
-或换 numpy 版本都会变。要压到 macOS 11 得反过来钉住 numpy 版本，而
-`requirements.txt` 头一条规矩就是"不锁版本"，所以这里没做 —— 与 Linux 那份
-裸文件"声明不了依赖"是同一类取舍：说清楚，而不是假装没有。
+**The minimum OS version is decided by the build machine, not by us.** Both
+architectures measured out to **macOS 14**: the main executable asks for
+11.0 / 10.13, but numpy's `_multiarray_umath.cpython-311-darwin.so` asks for
+14.0 — pip on the macOS 15 runner picks the highest numpy wheel it can run
+(`macosx_14_0`) rather than the most compatible one (`macosx_11_0`). CI's
+`Report the minimum macOS version the .app requires` step exists to print this
+number: **it is a fact, not an invariant** — changing the runner or the numpy
+version changes it. Pinning numpy's version would be needed to push it down to
+macOS 11, and the first rule in `requirements.txt` is "do not pin versions", so
+that was not done here — the same class of trade-off as Linux's bare file
+"cannot declare dependencies": say it clearly, rather than pretend it isn't so.
 
 ---
 
-## 🧪 测试
+## 🧪 Tests
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                     # 全套
-python -m pytest tests/test_vcf.py -q   # 只跑某一块
-python -m pytest -q -m "not perf"       # 跳过机器速度相关的门槛（CI 用这条）
+python -m pytest -q                     # full suite
+python -m pytest tests/test_vcf.py -q   # just one area
+python -m pytest -q -m "not perf"       # skip machine-speed-dependent thresholds (what CI runs)
 ```
 
-**关于 `perf` 标记**：少数门槛测的是"引擎有没有退化"，但读数是"每秒多少
-节点""3 秒内到了第几层"—— 在更慢的机器上，退化和慢机器在数字上无法区分。
-这类用例标记为 `perf`，CI 跳过（`-m "not perf"`，**303 条**），本地跑全量
-（**324 条**）。**正确性、增量一致性、时间合规、
-题库、VCF、棋型判定这些都不带标记**，它们在任意机器上都该通过 —— 时间上下限
-由引擎自己强制，与机器快慢无关。
+**About the `perf` marker**: a handful of thresholds test "has the engine
+regressed", but their readings are "how many nodes per second" or "what ply did
+it reach within 3 seconds" — on a slower machine, a regression and a slow machine
+are numerically indistinguishable. Such cases are marked `perf` and skipped by CI
+(`-m "not perf"`, **303 tests**), while locally the full suite runs
+(**324 tests**). **Correctness, incremental consistency, time compliance, the
+position suite, VCF and pattern classification carry no marker**; they should
+pass on any machine — the time bounds are enforced by the engine itself,
+independent of machine speed.
 
-| 测试文件 | 覆盖 |
+| Test file | Coverage |
 |---------|------|
-| `test_engine_parity.py` | 模块边界（`engine.py` 零 Qt / 零 torch，且不 import `main`）+ 状态可重置 + 重置后逐字段可复现 |
-| `test_win.py` / `test_incremental.py` | 位棋盘：连五检测（含换行陷阱）+ 增量状态与朴素实现逐步差分 |
-| `test_eval.py` | 棋型偏序与零和性 |
-| `test_tt.py` | 置换表条目类型、杀棋分归一化、跨局状态隔离 |
-| `test_search_mate.py` | 找得到杀、认得必败，并把引擎自报的杀棋线走一遍对账 |
-| `test_vcf.py` | 真链找得到 / 假必胜否得掉 / 三态可分 / `dist` 可复现 / **三档都真的开 VCF** |
-| `test_threat.py` | **启发式抢答层不存在**，而它当年处理的局面仍被正确处理 |
-| `test_difficulty.py` | 三档的时间 / 深度 / 吞吐门槛 + **低档要够得到自己的深度上限** |
-| `test_cancel.py` | 取消的延迟与"不留幽灵子" |
-| `test_board_geometry.py` | 像素↔格子换算（纯函数，无需 QApplication） |
-| `test_analysis.py` | 胜率折算：奇对称、单调、锚点值精确复现、**锚点必须是 `engine` 常量**、静态带不许自称 100% |
-| `test_no_literal_colors.py` | 界面里不再出现硬编码颜色字面量 |
-| `test_positions.py` | 局面题库：自洽性 + 旧引擎必错项冻结 + 新引擎解题率 |
+| `test_engine_parity.py` | Module boundaries (`engine.py` with zero Qt / zero torch, and not importing `main`) + state is resettable + field-for-field reproducibility after a reset |
+| `test_win.py` / `test_incremental.py` | Bitboard: five-in-a-row detection (including the line-wrap trap) + step-by-step diffing of the incremental state against a naive implementation |
+| `test_eval.py` | Pattern partial ordering and zero-sumness |
+| `test_tt.py` | Transposition entry types, mate-score normalisation, cross-game state isolation |
+| `test_search_mate.py` | Finds mates, recognises lost positions, and replays the engine's self-reported mate line to check the accounts |
+| `test_vcf.py` | A real chain is found / a false "must-win" is refuted / the three states are distinguishable / `dist` is reproducible / **all three levels really do have VCF on** |
+| `test_threat.py` | **The heuristic quick-answer layer does not exist**, while the positions it used to handle are still handled correctly |
+| `test_difficulty.py` | Time / depth / throughput thresholds for the three levels + **low levels reaching their own depth cap** |
+| `test_cancel.py` | Cancellation latency and "no ghost stones left behind" |
+| `test_board_geometry.py` | Pixel↔cell conversion (pure functions, no QApplication needed) |
+| `test_analysis.py` | Win-rate conversion: odd symmetry, monotonicity, anchor values reproduced exactly, **anchors must be `engine` constants**, the static band may not claim 100% |
+| `test_no_literal_colors.py` | The UI no longer contains hard-coded colour literals |
+| `test_positions.py` | Position suite: self-consistency + frozen "old engine must fail these" items + the new engine's solve rate |
 
-另有 `tools/gui_smoke.py`（无头界面冒烟）、`tools/ui_snapshot.py`（离屏抓图）、
-`tools/bench.py`（基准）、`tools/selfplay.py`（对旧引擎 A/B 胜率）、
-`tools/positions.py`（局面题库）、`tools/analyze_log.py`（复盘对局日志）、
-`tools/pivot_ab.py`（把某一手钉死或重复搜，量化时限的影响）。
+There are also `tools/gui_smoke.py` (headless UI smoke test),
+`tools/ui_snapshot.py` (offscreen screenshots), `tools/bench.py` (benchmark),
+`tools/selfplay.py` (A/B win rate against the old engine), `tools/positions.py`
+(position suite), `tools/analyze_log.py` (replay a game log) and
+`tools/pivot_ab.py` (pin a single move, or repeat the search, to quantify the
+effect of the time limit).
 
 ---
 
-## 📖 旧引擎案例（已删除的机制）
+## 📖 Old-engine case study (deleted mechanisms)
 
-v1.x 的 README 里曾有一篇 166 行的对局复盘，详细分析旧引擎如何靠
-"分层威胁响应 → 拼命模式 → 反攻致胜"在 54 步翻盘。**那一整套机制已经不存在**，
-原文自带的警告就是"不代表当前版本的决策过程"，所以这里只留下结论：
+The v1.x README once carried a 166-line game analysis detailing how the old
+engine came back from behind in 54 moves via "layered threat response →
+desperate mode → counter-attack win". **That entire mechanism no longer exists**,
+and the original text even warned that it "does not represent the current
+version's decision process", so only the conclusions are kept here:
 
-- **分层威胁响应**（约 130 行七段启发式抢答）失败在**判据覆盖不全**：
-  写成 `opp_win >= 2 or opp_live4 >= 2`，而实战最常见的双杀形态是
-  `opp_win == 1 且 opp_live4 >= 1`，恰好落在判据之外。
-- **拼命模式**（判必败后改用攻防混合评分、扫描对手准杀位）失败在**它靠的
-  是一个本身就不准的判断**：触发条件是 PVS 报出 `-10,000,000`，而那个分值
-  与旧的复合静态分**量程重叠**，分不清"三步后必死"和"这局面挺糟糕"。
+- **Layered threat response** (~130 lines of seven-part heuristic quick answers)
+  failed because **its criterion did not cover the cases**: it read
+  `opp_win >= 2 or opp_live4 >= 2`, whereas the most common double-threat shape
+  in real play is `opp_win == 1 and opp_live4 >= 1`, which falls exactly outside
+  it.
+- **Desperate mode** (switching to a mixed attack/defence score and scanning for
+  the opponent's near-winning points once a loss was judged) failed because **the
+  judgement it rested on was itself inaccurate**: it triggered when PVS reported
+  `-10,000,000`, and that score **overlapped in range** with the old composite
+  static score, so it could not tell "dead in three moves" from "this position is
+  pretty bad".
 
-两者的共同病根是**用有限条规则去近似一个可以精确判定的问题**。替代方案是
-静止搜索（精确数成五点个数）与 VCF（精确的强制序列，且能区分"没有杀"与
-"没算完"）。原始复盘全文仍在历史里可取：
+Both share the same root cause: **approximating a decidable problem with a
+finite set of rules**. Their replacements are quiescence search (which counts
+winning points exactly) and VCF (exact forced sequences, able to distinguish
+"there is no mate" from "I could not finish"). The full original analysis is
+still retrievable from history:
 
 ```bash
 git show d232fa7:README.md | sed -n '236,401p'
@@ -504,215 +629,168 @@ git show d232fa7:README.md | sed -n '236,401p'
 
 ---
 
-## 📝 更新日志
+## 📝 Changelog
 
 ### v2.1.0 (2026-10-02)
 
-> ⚠️ **本次更新是最后一次更新，从此对本旧版项目停止支持和维护。**
+> ⚠️ **This update is the last one. Support and maintenance for this legacy
+> project stop here.**
 >
-> 本次更新是对标 [GomokuAI v3.0.5 (Stable)](https://github.com/iamlinxuhan/GomokuAI)
-> 的 UI 重构优化，旨在带给 macOS 用户使用。
-> **不建议 Linux / Windows 用户下载本 Release 产物** ——
-> 建议 Windows / Linux 用户下载
-> [GomokuAI](https://github.com/iamlinxuhan/GomokuAI) 的最新引擎稳定版本。
+> This update is a UI refactor aligned with
+> [GomokuAI v3.0.5 (Stable)](https://github.com/iamlinxuhan/GomokuAI), aimed at
+> bringing it to macOS users. **Linux / Windows users are advised not to
+> download this Release's artefacts** — download the latest stable engine
+> version of [GomokuAI](https://github.com/iamlinxuhan/GomokuAI) instead.
 
-引擎一行未动，`enhanced == 0` 逐位一致；本版只搬界面。
+Not one line of the engine changed — `enhanced == 0` is bit-for-bit identical;
+this version moves the interface only.
 
-**界面**
+**Interface**
 
-- 🎨 **主题切换按钮重做**：从标题右侧一个 emoji 方按钮，改成标题**下一行**的
-  胶囊 —— 「当前主题(点击以切换)：」+ 自绘图标。日/月不再依赖字体里的 emoji
-  （各平台长得不一样，缺字时直接变方框），改为 `QPainterPath` 画的太阳/月亮
-  （太阳是实心圆减去八个轨道小圆，月亮是两圆相减，颜色从 `theme` 取）。
-- 🎨 **终局改成一条红线**：旧版画的是贯穿光带 + 每颗取胜子外面套一个环，读起来
-  「哪里赢了」要靠数环。现在是一条带深色衬底的红线（两端按方向探出 0.5 / 0.7
-  格，`FlatCap`），压在五连上，一眼看得出方向。**最后一手的环在终局时不再画**
-  —— 那是「刚下的一手」，而此时要说的是「赢在哪儿」。线色走
-  `theme._PALETTES["light"]["DANGER"]`：`theme.py` 是冻结的单一样本，加一个
-  顶层常量得改它，所以直接读那张表（两版 `theme.py` 逐字节相同）。
-- 🐛 **终局延迟 1 秒再弹遮罩**（`GAME_OVER_DELAY_MS`）：旧版落子即弹，「最后
-  一手」和上面那条红线都被遮罩盖住，玩家看到的第一个画面是"你赢了"而不是
-  "怎么赢的"。计时器单次触发、可取消，中途重开/退出会 `stop()`。
-- 🐛 **棋盘坐标标注改按墨迹定位**：间距由 `cell × 0.10` 放到 `0.18`，行号按
-  墨迹右沿贴边、字母按基线统一对齐。旧写法用 `AlignCenter`/`AlignBottom` 配
-  一个先验的 `band` 高度，遇到 `Q` 这类**带下伸的字母**时，逐字墨迹下沿会把
-  自己往上抬，整列字母跟着错位。
-- 🎨 **两张图表的标题说清是谁的**：`AI 评分` → `AI（黑棋/白棋）评分`（游戏面板
-  会告知图表 AI 执哪一方，tooltip 也写明），`棋面胜率（估计）` → `人类胜率
-  （估计）`。折算逻辑与数值一字未改，改的只是标题 —— 这两个名字此前要靠读者
-  自己从上下文推断。
-- 🐛 **难度卡的秒数改为从 `engine.DIFFICULTY` 读**：旧代码把 `3/7/15` 硬编码在
-  卡片上，与引擎里的真实值恰好相同，纯属巧合 —— 改表时不会有任何测试报警，
-  表现是「界面上写着 9 秒、AI 实际想了 20 秒」。三档的档位名与配色仍是本地的
-  （远古版的 `engine.DIFFICULTY` 没有 `name` 字段，**往那张表里加字段属于改
-  难度表**，不在「只搬界面」的范围里）。
-- 🐛 **强度条按主题取子色**：棋盘上那套棋子材质是对着**木色**调的，暗色卡面上
-  黑子只有 1.11:1 的对比度，换成白子才看得清。子只表示「几颗」（强度），
-  不表示「哪一方」—— 颜色选择页与面板的回合指示仍如实显示黑白。
+- 🎨 **The theme toggle was redone**: from a square emoji button to the right of
+  the title, to a pill on the **line below** the title — "Current theme (click to
+  switch):" + a self-drawn icon. The sun/moon no longer depend on the font's
+  emoji (they look different on every platform, and vanish into boxes when the
+  glyph is missing); they are now a sun/moon drawn with `QPainterPath` (the sun
+  is a solid circle minus eight orbiting small circles, the moon is two circles
+  subtracted, colours taken from `theme`).
+- 🎨 **The endgame is now a single red line**: the old version drew a full-width
+  light band plus a ring around every winning stone, so "where did I win" had to
+  be read by counting rings. It is now one red line with a dark backing (its ends
+  extending 0.5 / 0.7 cells along the direction, `FlatCap`) lying over the five,
+  so the direction is obvious at a glance. **The last-move ring is no longer
+  drawn at the endgame** — that ring means "the move just played", whereas at
+  this moment the message is "where did I win". The line colour comes from
+  `theme._PALETTES["light"]["DANGER"]`: `theme.py` is a frozen single sample, and
+  adding a top-level constant would mean editing it, so the table is read
+  directly (the two versions' `theme.py` are byte-for-byte identical).
+- 🐛 **The endgame overlay is delayed by one second** (`GAME_OVER_DELAY_MS`):
+  previously it appeared the instant the stone landed, covering both the "last
+  move" ring and the red line above it — the first thing the player saw was "you
+  won" rather than "how you won". The timer is single-shot and cancellable, and
+  restarting or quitting mid-way calls `stop()`.
+- 🐛 **Board coordinate labels are now positioned by ink**: the gap goes from
+  `cell × 0.10` to `0.18`, row numbers hug the edge by their ink's right edge,
+  and letters share a common baseline. The old code used
+  `AlignCenter`/`AlignBottom` with an a-priori `band` height, so a letter with a
+  descender like `Q` would push its own ink's bottom edge upward and misalign the
+  whole column.
+- 🎨 **The two charts now say whose they are**: `AI score` →
+  `AI (black/white) score` (the game panel tells the chart which side the AI
+  plays, and the tooltip says so too), and `Board win rate (est.)` →
+  `Human win rate (est.)`. The conversion logic and the numbers are unchanged to
+  the character — only the titles — because the two names previously required the
+  reader to infer them from context.
+- 🐛 **The difficulty card's seconds are now read from `engine.DIFFICULTY`**: the
+  old code hard-coded `3/7/15` on the cards, which happened to match the real
+  values in the engine. That was pure coincidence — changing the table would
+  raise no test alarm, and the symptom would be "the UI says 9 seconds while the
+  AI actually thinks for 20". The three levels' names and colours are still
+  local (the legacy `engine.DIFFICULTY` has no `name` field, and **adding a field
+  to that table would be changing the difficulty table**, which is outside
+  "move the interface only").
+- 🐛 **The strength bar picks its stone colour by theme**: the stone material on
+  the board was tuned against **wood**, and on a dark card the black stone has
+  only 1.11:1 contrast, so white is used to stay legible. The stones indicate
+  only "how many" (the strength), not "which side" — the colour-selection page
+  and the panel's turn indicator still show black and white faithfully.
 
-**打包：新增 macOS 产物**
+**Packaging: new macOS artefacts**
 
-- ✨ **Release 增加 macOS arm64 与 Intel 两个架构的 `.dmg` / `.pkg`**，共 4 份。
-  这是这个远古版存在的理由 —— 引擎是纯 Python，不依赖平台专属的可执行文件，
-  而那套 C++ 引擎只有 Windows / Linux 的二进制。两个架构**各自在原生 runner
-  上构建**，不做 universal2（PyQt5 的 Qt 只有分架构的 wheel，拼不出双架构
-  的 `.app`），并且先断言 `platform.machine()` 与 runner 标签一致 —— 产物
-  自己不自证架构，标签被改指是查不出来的。
-- 📝 **最低系统版本是 macOS 14（Sonoma）**，且这个数**由构建机决定**：CI 里
-  量出来的（`.app` 内全部二进制的最高 `minos`）是 numpy 的
-  `_multiarray_umath...so` 要 14.0，因为 pip 在 macOS 15 的 runner 上挑了
-  `macosx_14_0` 那档 wheel 而不是 `macosx_11_0`。主程序自己只要 11.0 / 10.13。
-  压到更低要反过来钉住 numpy 版本，与「不锁版本」冲突，故不做 —— 改为在 CI
-  里把这个数打出来、在 README 里写清楚。
-- 📝 `.ico` 在 CI 里转成 `.icns`（源图是 Windows 那份单张 256×256），
-  `CFBundleName` / `CFBundleDisplayName` 改成「五子棋AI」与 Windows/Linux
-  对齐，改完**重新做 ad-hoc 签名** —— Info.plist 计入 bundle 签名，改它会让
-  PyInstaller 那份签名失效，应用反而变成「已损坏」。
-- 📝 **没有 Apple 开发者签名**（需要每年 99 美元的账号），所以首次打开要绕一下
-  Gatekeeper。README 的下载说明里写了两种放行方式（系统设置里点「仍要打开」、
-  或命令行 `xattr -dr com.apple.quarantine`）——报错文案是「Apple 无法检查其
-  是否包含恶意软件」，容易被当成文件损坏。顺带写明**网上流传的
-  「Control 点按 → 打开」那条捷径在 macOS 15 上已被 Apple 移除**，现在按它
-  做只会再被拦一次。
+- ✨ **The Release gains `.dmg` / `.pkg` for both macOS arm64 and Intel**, 4
+  artefacts in total. This is the reason this legacy version exists — the engine
+  is pure Python and depends on no platform-specific binary, whereas that C++
+  engine ships only Windows / Linux binaries. The two architectures are **each
+  built on a native runner**, not as universal2 (PyQt5's Qt has only
+  per-architecture wheels, so a dual-architecture `.app` cannot be assembled),
+  and `platform.machine()` is asserted against the runner label first —
+  an artefact does not prove its own architecture, and a label quietly
+  repointed cannot be detected afterwards.
+- 📝 **The minimum OS version is macOS 14 (Sonoma)**, and that number **is
+  decided by the build machine**: what CI measured (the highest `minos` across
+  every binary inside the `.app`) comes from numpy's `_multiarray_umath...so`
+  requiring 14.0, because pip on the macOS 15 runner picked the
+  `macosx_14_0` wheel rather than `macosx_11_0`. The main executable itself asks
+  for only 11.0 / 10.13. Pushing it lower would require pinning numpy's version,
+  which conflicts with "do not pin versions", so it was not done — instead the
+  number is printed in CI and stated clearly in the README.
+- 📝 The `.ico` is converted to `.icns` in CI (the source is the Windows
+  256×256 single image), and `CFBundleName` / `CFBundleDisplayName` are set to
+  「五子棋AI」 to match Windows/Linux, after which **the ad-hoc signature is
+  redone** — Info.plist counts towards the bundle signature, and editing it
+  invalidates the signature PyInstaller applied, turning the app into "damaged".
+- 📝 **There is no Apple developer signature** (that needs a $99/year account),
+  so the first launch needs a Gatekeeper detour. The README's download notes
+  describe two ways through (click "Open Anyway" in System Settings, or
+  `xattr -dr com.apple.quarantine` from the command line) — the error text reads
+  「Apple cannot check it for malicious software」, which is easily mistaken for a
+  damaged file. It also notes that **the widely circulated "Control-click →
+  Open" shortcut was removed by Apple in macOS 15**, and following it now just
+  gets you blocked again.
 
-**兼容性**
+**Compatibility**
 
-- 本次**未**搬入 C++ 版新增的「引擎」「当前 TCP 端口」两行与相关日志：本版
-  没有 C++ 服务端，也没有端口池，搬过来只能是永远显示「—」的死行。
-- 难度仍是 **3 档**（初级/中级/高级，3 / 7 / 15 秒），未随 C++ 版扩到 5 档。
+- This update did **not** bring in the C++ version's new "Engine" and "current
+  TCP port" rows or their logging: this version has no C++ server and no port
+  pool, so they could only be dead rows forever showing "—".
+- Difficulty is still **3 levels** (Novice / Intermediate / Advanced, 3 / 7 / 15
+  seconds), not expanded to the C++ version's 5.
 
 ### v2.0.2 (2026-09-24)
 
-**引擎**
+**Engine**
 
-- 🐛 **中级档的时限 5.0 s → 7.0 s**：一条真实败局
-  （`game_log_20260922_235240`，中级执白、人类第 31 手 J8 胜）的胜负手在第 4
-  手 —— 盘面只有三颗子时，**第 4 层选 K9，第 5 层选 K7/K11**，相邻两层给出
-  胜负相反的结论。把这一手钉死、其余仍用旧预算重放：走 K9 得到
-  **黑胜 · 第 31 手 J8**，与日志**逐手相同（31 手一手不差）**；走 K7 / K11
-  则是白方第 12 / 18 手反杀。旧预算 `5.0 × 0.85 = 4250 ms` 恰好压在临界点上
-  —— 同一份输入重复搜，
-  5.0 s 下 K7 与 K9 **交替出现**（空载 12 次里 3 次走 K9、另一批 8 次里 0 次，
-  起 6 个满载进程后 **4/4 全走 K9**），6.0 s 起才稳定在第 5 层，7.0 s 在其上
-  留约 0.85 s 余量。**这是把地平线推远，不是治好了** —— 见「难度说明」一节。
-- 🐛 **日志不再把"没算完"讲成"算过了"**：`_vcf_defence` 原先用同一个 `-1`
-  表示"候选集扫完了、没有挡点"与"预算用尽、没扫完"，调用方分不开，于是两种
-  情况在日志里说同一句 `PVS搜索(对手有VCF)`。现在分成
-  `VCF_DEFENCE_NONE` / `VCF_DEFENCE_UNKNOWN` 两个取值，`reason` 各说各的。
-  顺带把对手的冲四威胁深度（`vcf_dist`）从"只在找到挡点时记"改为总是记录 ——
-  诊断那局时缺的正是这个数。
-- ✨ 新增两条护栏：`test_difficulty.py::test_mid_level_sees_the_fifth_layer_
-  on_the_pivot_move`（`perf`，中级必须在那第 4 手上看到第 5 层）、
-  `test_vcf.py::test_vcf_defence_reports_unknown_when_the_budget_is_gone`。
-- ✨ 新增 `tools/pivot_ab.py`：把上面那条"这一手是胜负手"做成可复现的对照 ——
-  `--budget 5.0` 分别钉死 K9 / K7 / K11 看结局，`--stability N` 则同一份输入
-  重复搜 N 次、统计引擎自己选了什么（"临界点上会翻面"就是靠它测出来的）。
+- 🐛 **Intermediate's time limit 5.0 s → 7.0 s**: in a real lost game
+  (`game_log_20260922_235240`, Intermediate playing white, human winning on move
+  31 at J8) the decisive move is move 4 — with only three stones on the board,
+  **ply 4 picks K9 while ply 5 picks K7/K11**, adjacent plies reaching opposite
+  conclusions. Pinning that move and replaying the rest with the old budget: K9
+  gives **black wins · move 31 J8**, **matching the log move for move (all 31
+  moves identical)**; K7 / K11 gives white a counter-win on move 12 / 18. The
+  old budget `5.0 × 0.85 = 4250 ms` sat exactly on the tipping point — repeating
+  the search on the same input, K7 and K9 **alternate** at 5.0 s (3 out of 12
+  idle runs played K9, 0 out of another 8; with 6 saturated processes,
+  **4/4 all played K9**), only stabilising at ply 5 from 6.0 s, with 7.0 s
+  leaving about 0.85 s of margin on top. **This pushes the horizon farther out;
+  it does not cure anything** — see the "Difficulty" section.
+- 🐛 **The log no longer reports "I could not finish" as "I finished"**:
+  `_vcf_defence` used the same `-1` for both "the candidate set was exhausted,
+  there is no blocking point" and "the budget ran out, it was not exhausted", so
+  the caller could not tell them apart and both cases logged the same
+  `PVS search (opponent has a VCF)`. It is now split into `VCF_DEFENCE_NONE` and
+  `VCF_DEFENCE_UNKNOWN`, and `reason` says which. Alongside this, the opponent's
+  four-threat depth (`vcf_dist`) is always recorded rather than only when a
+  blocking point is found — that was exactly the number missing when diagnosing
+  that game.
+- ✨ Two new guards:
+  `test_difficulty.py::test_mid_level_sees_the_fifth_layer_on_the_pivot_move`
+  (`perf` — Intermediate must see ply 5 on that move 4) and
+  `test_vcf.py::test_vcf_defence_reports_unknown_when_the_budget_is_gone`.
+- ✨ New `tools/pivot_ab.py`: it turns the "this move decides the game" finding
+  above into a reproducible comparison — `--budget 5.0` pins K9 / K7 / K11
+  respectively and shows the outcome, while `--stability N` repeats the search N
+  times on the same input and counts what the engine itself chose ("it flips at
+  the tipping point" was measured with exactly this).
 
-**打包**
+**Packaging**
 
-- ✨ **Linux 增加免安装可执行文件** `GomokuAI_For_Linux_AMD` /
-  `GomokuAI_For_Linux_ARM`（PyInstaller `--onefile`）：无扩展名，`chmod +x`
-  就能跑，不要 root、不写 `/opt`、没有安装脚本。**与已有的 `.deb` / `.pkg`
-  并存，不是取代** —— 那两份能在 `Depends:` 里声明图形库与 CJK 字体候选链，
-  裸文件声明不了，缺什么就报什么（或满屏方框）。
-- 📝 README 的「打包」一节拆成 Windows / Linux 两段，写明 Linux 的 onefile
-  为什么取代不了 `.deb`，以及可执行位为什么只能由用户自己加（Release 资产
-  只存字节，`upload-artifact` 同样不保留权限 —— CI 补偿不了这件事）。
+- ✨ **Linux gains no-install executables** `GomokuAI_For_Linux_AMD` /
+  `GomokuAI_For_Linux_ARM` (PyInstaller `--onefile`): no extension, `chmod +x`
+  and run — no root, nothing written to `/opt`, no install script. **They
+  coexist with the existing `.deb` / `.pkg` rather than replacing them** — those
+  can declare the graphics libraries and a CJK font candidate chain in
+  `Depends:`, whereas a bare file cannot, so it reports whatever is missing (or
+  shows a screen full of boxes).
+- 📝 The README's "Packaging" section was split into a Windows and a Linux part,
+  explaining why Linux's onefile cannot replace the `.deb`, and why the
+  executable bit can only be set by the user (Release assets store bytes only,
+  and `upload-artifact` does not preserve permissions either — CI cannot
+  compensate for this).
 
-### v2.0.1 (2026-09-24)
+### v2.0.1 and earlier
 
-**打包：Windows 的 `.7z` 换成 `.exe`**（引擎未动，与本版无关）
-
-- ♻️ **安装包改为 Inno Setup 编译的 `.exe`**（`installer/GomokuAI.iss`），
-  取代原来的 `GomokuAI_For_Windows_v*.7z` + `install.bat`。旧方案双击后是
-  一个黑窗口、没有安装向导、「添加或删除程序」里查无此物（卸载要靠另一个
-  `.bat`）、失败时只能 `pause` 让人自己看 —— 这些正是"安装程序"该做的事。
-  新安装包装进 `%LOCALAPPDATA%\GomokuAI`，不需要管理员权限，带向导、带
-  开始菜单/桌面快捷方式、带卸载项。
-- ✨ **另出一份免安装单文件版** `GomokuAI_Portable_v*.exe`（PyInstaller
-  `--onefile`），拷到哪都能跑。两份产物各有各的用处：onedir 启动快，适合
-  装到硬盘上；onefile 免安装，代价是每次启动要先把运行时解包到临时目录。
-- 📝 **仓库地址迁移**：`iamlinxuhan/GomokuAI` → `iamlinxuhan/GomokuAI-Py`，
-  README 里的 Releases / clone 链接随之更新。
-- 📝 `.gitignore` 补上 `dist-installer/`（Inno 的输出目录）—— 它**不**被
-  原有的 `dist/` 覆盖：带斜杠的模式只匹配同名的目录。
-
-### v2.0.0 (2026-09-19)
-
-**引擎（`engine.py`，评估与搜索整体替换）**
-
-- ♻️ **删除威胁响应层**：`_check_immediate_threat`（七段启发式抢答）、
-  `_find_forced_win`（把"搜不完"当"没有必胜"）、`_find_winning_moves`、
-  `_find_live_four_moves`、拼命模式阈值 —— 它们的职责改由**能给出确定性
-  结论**的静止搜索与 VCF 承担。`tests/test_threat.py` 断言这些名字不再存在。
-- ♻️ **重新定义棋型**：按集合语义数成五点的个数（`|F|≥2` 活四、`|F|=1`
-  冲四），取代旧版把 `.XX.X.` 与 `.X.XX.` 判成同一个 key 的三元组。
-- ♻️ **评估严格零和**，删除 `ai - human * 0.85` 这类不对称系数。
-- ✨ **VCF 连续冲四**：三态返回（胜 / 无胜 / 算不完），防守侧 AND 语义；
-  独立预算 + 深度上限，且时间计入主搜索时限。
-- 🐛 **修复"进攻方假必胜"**：旧版 VCF 在攻防两侧都用 OR 语义，于是一条
-  对手能挡住的线路也会被报成必胜。
-- 🐛 **置换表杀棋分按局面归一化**（存 `value+ply`、取 `value-ply`）。
-- 🐛 **搜索状态归实例**：TT/历史/杀手着法不再放模块全局，同一局面不会
-  因为"这次捡到了更暖的缓存"而走出不同的棋。
-- 🐛 **Zobrist 表固定种子**：旧版用未播种的 `np.random`，同一进程每次启动
-  得到不同的表。
-- ⚡ **位棋盘 + 全增量评估**：`check_win` 231 µs → 2.26 µs。
-- 🐛 **初级档不再失明**：`DIFFICULTY[1]` 由 `time=1.5, vcf_budget=0.0`
-  改为 `time=3.0, vcf_budget=0.3`。旧配置下初级既算不出自己的冲四链、也
-  看不见对手的，且 1.275 秒预算只够第 3 层 —— 在一个真实中局上第 3 层给出
-  的判断与第 4 层**方向相反**，于是输掉了一局它本该赢的棋。同一局同一位
-  对手，改后初级第 15 手连五取胜。
-
-**界面（`main.py` + 新增 8 个模块）**
-
-- 🎨 **统一设计系统**：新增 `theme.py`（颜色/字号/间距/圆角的单一来源 +
-  QSS 生成）、`ui_kit.py`（控件原语）、`board_geometry.py`（像素↔格子换算）、
-  `board_render.py`（棋盘渲染）。颜色字面量从散落 36 处收敛到一处。
-- 🎨 **冷调科技 + 暖木棋盘**：木纹程序化生成并保留光泽与光照梯度，棋子是
-  带镜面高光与接触投影的 sprite（不再每颗子重建渐变）；界面 chrome 与状态色
-  则改冷 —— `ACCENT` 由暖琥珀改冷青，`INFO` 由蓝改紫以免与注入的青色撞色
-  —— 棋盘因此成为全局唯一的暖色焦点。加载页与两个选择页加一层极弱的结构
-  底纹（1px 网格 + 标题区径向辉光）与 HUD 四角括号，选择卡左上角加等宽序号。
-  **对局页不加底纹** —— 棋盘四周必须干净（`ui_snapshot` 的四角探针钉着）。
-- 🎨 **右侧面板新增两张图表**（`charts.py` 自绘，不引绘图库）：AI 评分折线
-  （symlog 纵轴、数量级只增不减、带搜索参数读数行）与棋面胜率曲线
-  （纵轴固定 0–100% 不自适应）。折算逻辑在 `analysis.py`，**每个锚点都是
-  `engine.py` 里的一个分值常量**，`tests/test_analysis.py` 断言这一点 ——
-  这样"为什么活三是 65%"能直接回答"因为 `LV_THREE_LIVE = 30000`"，而不是
-  "因为有人调了一组参数直到看着顺眼"。胜率是引擎模型下的估计值，不是统计
-  标定的概率，图标题、tooltip、模块 docstring 三处都写明。
-- 🐛 **修掉难度卡上的假标签**：卡片副标题原写"搜索深度 1/2/3"，而三档的深度
-  上限其实是 4/10/24、实测到 4/4/5。改报思考时限 —— 那是 `engine.DIFFICULTY`
-  里真实存在、用户也能直接感知的量。
-- 🐛 **补上禁用态**：旧版全文件零个 `:disabled` 规则 —— AI 思考期间悔棋按钮
-  外观完全正常却点不动。现在每个按钮四态齐全。
-- 🐛 **棋盘坐标与日志对齐**：棋盘列标改为走 `gamelog.col_letter`（跳过 I），
-  此前 19 列里有 11 列与棋谱/日志/题库对不上。
-- 🐛 **修复右/下多出 34px**：旧代码把"19 个格点"当成"19 段"，右侧凭空多一格。
-- ⚡ **悬停局部重绘**：旧版鼠标每动一像素就整盘重绘。
-
-**打包与 CI**
-
-- 📦 **去掉 PyTorch/CUDA**：GPU 分支从未生效（检测结果被紧随其后的赋值
-  覆盖），安装包不再捆绑 CUDA 运行时，也不必再为 2GB 上限拆包。
-- ✅ **CI 新增测试 job**：每次 push / PR 在 Python 3.11 与 3.13 上跑全套
-  pytest（此前 CI 只在打 tag 时构建，不做任何测试）。
-- ✅ **发版前必须过测试**：`release` job 的 `needs` 补上 `test` —— 此前测试
-  失败不会拦住发版。
-
-### 更早的版本（v1.5 – v1.8.0）
-
-这些版本都在 **PyTorch/CUDA 打包**这条线上迭代，而那整条线在 v2.0.0 里已被
-删除（GPU 分支从未生效）。留下大事记备查：
-
-- **v1.8.0** (2026-06-17) — 统一打包 + 多 GPU 自动检测；6 个 job 精简为 3 个。
-- **v1.7.x** (2026-06-06) — 修 ARM 构建超时（改为 `apt install python3-pyqt5`
-  + venv）、缩减 torch 体积、修 Windows 打包脚本。
-- **v1.6.x** (2026-06-06) — 从 NSIS 安装器到 7z 自解压、再到 `.deb`/`.pkg`
-  的多平台打包；期间反复处理 GitHub Release 的 2GB 单文件上限与
-  `--onefile` → `--onedir` 的切换；另有若干次 YAML 语法修复。
-- **v1.5** (初始版本) — PVS+LMR 搜索 + 固定数组置换表 + 专业棋型权重 +
-  增强 TSS 攻防 + GPU 加速 + 开局库。
-
-完整历史见 `git log`。
+**Kept in Chinese.** The entries from v2.0.1 backwards document mechanisms that
+were deleted in v2.0.0 and are no longer part of this codebase (the old GPU
+packaging line and the early PyTorch/CUDA iterations), so translating them would
+describe software that no longer exists. The full text is in
+[README.zh-CN.md](README.zh-CN.md#更新日志).
