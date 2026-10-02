@@ -101,6 +101,13 @@
 Intel 用 `AMD`。装错了不会自动回退 —— Intel 那份能在 Apple Silicon 上经
 Rosetta 2 跑（系统会提示装 Rosetta），但反过来不行。
 
+**最低系统版本是 macOS 14（Sonoma）**，两个架构都一样。这个数字不是我们定的，
+是 CI 里量出来的（`.app` 内全部二进制里最高的 `minos`）：主程序自己只要 11.0
+（arm64）/ 10.13（Intel），但 numpy 那个 `_multiarray_umath.cpython-311-darwin.so`
+要 14.0 —— pip 在 macOS 15 的构建机上会挑它能跑的最高一档 wheel，而 numpy 有
+`macosx_11_0` 与 `macosx_14_0` 两档。**低版本 macOS 上会直接启动失败**，不会
+优雅降级。
+
 **统一版本**：都是**纯 CPU 运行，不需要显卡驱动，也不需要安装 PyTorch/CUDA**。
 
 **免安装的那几份不声明依赖。** 系统里缺 `libgl1` / xcb 那几个库、或者一个中文字体
@@ -423,6 +430,16 @@ PyQt5-Qt5 的 wheel 只有 `macosx_11_0_arm64` 与 `macosx_10_13_x86_64` 两份�
 ad-hoc 签名（`codesign -s -`）。后果就是用户首次打开要绕一下 Gatekeeper，
 做法写在[下载说明](#运行方式一直接下载-release)里。
 
+**最低系统版本由构建机决定，不由我们决定。** 实测两个架构的产物都是
+**macOS 14**：主程序自己是 11.0 / 10.13，但 numpy 的
+`_multiarray_umath.cpython-311-darwin.so` 要 14.0 —— pip 在 macOS 15 的
+runner 上会挑它能跑的最高一档 numpy wheel（`macosx_14_0`），而不是最兼容的
+那一档（`macosx_11_0`）。CI 里那一步 `Report the minimum macOS version the
+.app requires` 就是把这个数打出来用的：**它是事实，不是不变量**，换 runner
+或换 numpy 版本都会变。要压到 macOS 11 得反过来钉住 numpy 版本，而
+`requirements.txt` 头一条规矩就是"不锁版本"，所以这里没做 —— 与 Linux 那份
+裸文件"声明不了依赖"是同一类取舍：说清楚，而不是假装没有。
+
 ---
 
 ## 🧪 测试
@@ -541,6 +558,12 @@ git show d232fa7:README.md | sed -n '236,401p'
   上构建**，不做 universal2（PyQt5 的 Qt 只有分架构的 wheel，拼不出双架构
   的 `.app`），并且先断言 `platform.machine()` 与 runner 标签一致 —— 产物
   自己不自证架构，标签被改指是查不出来的。
+- 📝 **最低系统版本是 macOS 14（Sonoma）**，且这个数**由构建机决定**：CI 里
+  量出来的（`.app` 内全部二进制的最高 `minos`）是 numpy 的
+  `_multiarray_umath...so` 要 14.0，因为 pip 在 macOS 15 的 runner 上挑了
+  `macosx_14_0` 那档 wheel 而不是 `macosx_11_0`。主程序自己只要 11.0 / 10.13。
+  压到更低要反过来钉住 numpy 版本，与「不锁版本」冲突，故不做 —— 改为在 CI
+  里把这个数打出来、在 README 里写清楚。
 - 📝 `.ico` 在 CI 里转成 `.icns`（源图是 Windows 那份单张 256×256），
   `CFBundleName` / `CFBundleDisplayName` 改成「五子棋AI」与 Windows/Linux
   对齐，改完**重新做 ad-hoc 签名** —— Info.plist 计入 bundle 签名，改它会让
