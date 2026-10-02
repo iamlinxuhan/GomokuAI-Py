@@ -3,9 +3,10 @@
 > **本代码是支持 macOS 的远古版本**，最新 C++ 引擎优化重构版见
 > https://github.com/iamlinxuhan/GomokuAI 。
 > 本旧版仓库已迁至 https://github.com/iamlinxuhan/GomokuAI-Py 。
-> 引擎是纯 Python（不依赖任何平台专属的可执行文件），所以 macOS 上可以装
-> Python + PyQt5 直接[从源码运行](#运行方式二从源码运行)；但本仓库的 CI 只出
-> Windows / Linux 产物，**不提供 macOS 安装包**。
+> 引擎是纯 Python（不依赖任何平台专属的可执行文件），所以 macOS 上也可以装
+> Python + PyQt5 直接[从源码运行](#运行方式二从源码运行)。Release 里出
+> **macOS arm64 与 Intel 两个架构的 `.dmg` / `.pkg`** —— 首次打开要绕一下
+> Gatekeeper（原因与做法见[下载说明](#运行方式一直接下载-release)）。
 
 > **本次更新是最后一次更新，从此对本旧版项目停止支持和维护。**
 
@@ -72,6 +73,33 @@
 | Linux amd64 | `GomokuAI_For_Linux_AMD` | **免安装**：单个可执行文件，`chmod +x` 后直接运行 |
 | Linux arm64 | `GomokuAI_For_Linux_ARM.pkg` | **安装包**：解包后 `sudo ./install.sh` |
 | Linux arm64 | `GomokuAI_For_Linux_ARM` | **免安装**：同上，arm64 架构 |
+| macOS arm64 | `GomokuAI_For_MacOS_ARM.dmg` | **安装包**（推荐）：打开后把「五子棋AI」拖进 Applications，不需要密码 |
+| macOS arm64 | `GomokuAI_For_MacOS_ARM.pkg` | **安装包**：向导安装，装进 `/Applications`，要管理员密码 |
+| macOS Intel | `GomokuAI_For_MacOS_AMD.dmg` | **安装包**（推荐）：同上，x86_64（Intel Mac） |
+| macOS Intel | `GomokuAI_For_MacOS_AMD.pkg` | **安装包**：同上，x86_64（Intel Mac） |
+
+**macOS 上首次打开要绕一下 Gatekeeper。** 本项目的 macOS 产物**没有 Apple 开发者
+签名**（那需要每年 99 美元的开发者账号），而 macOS 对「从网上下载的、未签名」
+的应用一律拦下，报的是「无法打开，因为 Apple 无法检查其是否包含恶意软件」。
+**这不是文件损坏**，放行方式二选一：
+
+- **图形界面**（推荐）：先双击一次，让它被拦下 —— 然后打开**系统设置 →
+  隐私与安全性**，往下翻到「安全性」一栏，那里会出现一条关于「五子棋AI」的
+  提示，点**「仍要打开」**并确认。只需做一次，之后双击就正常。
+  ⚠️ 这个按钮**只在被拦下后的大约一小时内出现**，翻不到就再双击一次应用。
+- **命令行**（最快，直接摘掉隔离标记）：
+
+  ```bash
+  xattr -dr com.apple.quarantine /Applications/GomokuAI.app
+  ```
+
+> **已经不管用的老办法**：网上大量教程仍写着「按住 Control 点图标 → 打开 →
+> 再点一次打开」。那条捷径在 **macOS 15 Sequoia 上被 Apple 移除了**，
+> 现在按它做只会再被拦一次。
+
+两个架构**都要下自己机器对应的那一份**：Apple Silicon（M 系列）用 `ARM`，
+Intel 用 `AMD`。装错了不会自动回退 —— Intel 那份能在 Apple Silicon 上经
+Rosetta 2 跑（系统会提示装 Rosetta），但反过来不行。
 
 **统一版本**：都是**纯 CPU 运行，不需要显卡驱动，也不需要安装 PyTorch/CUDA**。
 
@@ -267,13 +295,13 @@ GomokuAI/
 ├── requirements.txt      # 运行时依赖（numpy / PyQt5）
 ├── requirements-dev.txt  # 开发与打包依赖（含 pytest / pyinstaller）
 ├── input.png          # 设计参考图（棋盘配色的取样来源，**运行时不读取**）
-├── 五子棋.ico          # 程序图标（Windows 打包用）
+├── 五子棋.ico          # 程序图标（Windows 直接用；macOS 打包时转成 .icns）
 └── README.md
 ```
 
 ---
 
-## 🛠️ 打包（Windows / Linux）
+## 🛠️ 打包（Windows / Linux / macOS）
 
 两边都是**两份产物**：一份装进系统，一份免安装。CI 上就是这样，本地照做即可。
 
@@ -352,6 +380,48 @@ pyinstaller --onefile --windowed --name "GomokuAI_For_Linux_AMD" main.py
 - **可执行位不在文件里。** Release 资产只存字节，用户下到的文件是 `0644`，
   必须自己 `chmod +x`。artifact 那一趟（`upload-artifact`）同样不保留权限。
   CI 不做任何补偿 —— 补偿不了，只能在 README 里写清楚。
+
+### macOS
+
+```bash
+# ① 先把 Windows 那个 .ico 转成 .icns（macOS 只认 .icns）
+python -c "from PIL import Image; import glob, os; \
+src = Image.open(glob.glob('*.ico')[0]).convert('RGBA'); \
+os.makedirs('AppIcon.iconset', exist_ok=True); \
+[src.resize((p, p), Image.LANCZOS).save('AppIcon.iconset/' + n) \
+ for p, n in [(16,'icon_16x16.png'), (32,'icon_16x16@2x.png'), \
+              (32,'icon_32x32.png'), (64,'icon_32x32@2x.png'), \
+              (128,'icon_128x128.png'), (256,'icon_128x128@2x.png'), \
+              (256,'icon_256x256.png'), (512,'icon_256x256@2x.png'), \
+              (512,'icon_512x512.png'), (1024,'icon_512x512@2x.png')]]"
+iconutil -c icns AppIcon.iconset -o AppIcon.icns
+
+# ② .app
+pyinstaller --windowed --name "GomokuAI" \
+  --osx-bundle-identifier com.iamlinxuhan.gomokuai --icon AppIcon.icns main.py
+
+# ③ 换成中文显示名，然后**重签**（改 Info.plist 会让上一步的签名失效）
+/usr/libexec/PlistBuddy -c "Set :CFBundleName 五子棋AI" \
+  dist/GomokuAI.app/Contents/Info.plist
+/usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 五子棋AI" \
+  dist/GomokuAI.app/Contents/Info.plist
+codesign --force --deep --sign - dist/GomokuAI.app
+```
+
+③ 出来的 `dist/GomokuAI.app` 再由 `hdiutil`（`.dmg`）和 `pkgbuild`（`.pkg`）
+收成 Release 上那两种包，脚本都在 CI 里。
+
+**两个架构是各自原生构建的，不是 universal2。** PyInstaller 要把 PyQt5 的 Qt
+动态库一并收进 `.app`，而 universal2 要求包里每一个 Mach-O 都是 fat 的 ——
+PyQt5-Qt5 的 wheel 只有 `macosx_11_0_arm64` 与 `macosx_10_13_x86_64` 两份，
+拼不出一个双架构的 Qt。硬做只会得到一个「有一半架构起不来」的 `.app`。CI 里
+`macos-15`（arm64）与 `macos-15-intel`（x86_64）各跑一遍，并且**先断言
+`platform.machine()` 与标签一致**：产物自己不自证架构，标签被悄悄改指是查不
+出来的。
+
+**没有代码签名。** 需要 Apple 开发者账号（每年 99 美元），本项目没有，只做了
+ad-hoc 签名（`codesign -s -`）。后果就是用户首次打开要绕一下 Gatekeeper，
+做法写在[下载说明](#运行方式一直接下载-release)里。
 
 ---
 
@@ -462,6 +532,25 @@ git show d232fa7:README.md | sed -n '236,401p'
 - 🐛 **强度条按主题取子色**：棋盘上那套棋子材质是对着**木色**调的，暗色卡面上
   黑子只有 1.11:1 的对比度，换成白子才看得清。子只表示「几颗」（强度），
   不表示「哪一方」—— 颜色选择页与面板的回合指示仍如实显示黑白。
+
+**打包：新增 macOS 产物**
+
+- ✨ **Release 增加 macOS arm64 与 Intel 两个架构的 `.dmg` / `.pkg`**，共 4 份。
+  这是这个远古版存在的理由 —— 引擎是纯 Python，不依赖平台专属的可执行文件，
+  而那套 C++ 引擎只有 Windows / Linux 的二进制。两个架构**各自在原生 runner
+  上构建**，不做 universal2（PyQt5 的 Qt 只有分架构的 wheel，拼不出双架构
+  的 `.app`），并且先断言 `platform.machine()` 与 runner 标签一致 —— 产物
+  自己不自证架构，标签被改指是查不出来的。
+- 📝 `.ico` 在 CI 里转成 `.icns`（源图是 Windows 那份单张 256×256），
+  `CFBundleName` / `CFBundleDisplayName` 改成「五子棋AI」与 Windows/Linux
+  对齐，改完**重新做 ad-hoc 签名** —— Info.plist 计入 bundle 签名，改它会让
+  PyInstaller 那份签名失效，应用反而变成「已损坏」。
+- 📝 **没有 Apple 开发者签名**（需要每年 99 美元的账号），所以首次打开要绕一下
+  Gatekeeper。README 的下载说明里写了两种放行方式（系统设置里点「仍要打开」、
+  或命令行 `xattr -dr com.apple.quarantine`）——报错文案是「Apple 无法检查其
+  是否包含恶意软件」，容易被当成文件损坏。顺带写明**网上流传的
+  「Control 点按 → 打开」那条捷径在 macOS 15 上已被 Apple 移除**，现在按它
+  做只会再被拦一次。
 
 **兼容性**
 

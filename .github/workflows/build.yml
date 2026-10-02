@@ -372,6 +372,188 @@ jobs:
 
 
   # ============================================================
+  #  macOS（arm64 + x86_64，各出 .dmg 与 .pkg）
+  # ============================================================
+  build-macos:
+    # 两个架构**在各自的 runner 上原生构建**，不做 universal2。原因不是图省事：
+    # PyInstaller 要把 PyQt5 的 Qt 动态库一并收进 .app，而 universal2 要求包里
+    # **每一个** Mach-O 都是 fat 的 —— PyQt5-Qt5 的 wheel 只有
+    # `macosx_11_0_arm64` 与 `macosx_10_13_x86_64` 两份，拼不出一个双架构的 Qt。
+    # 硬做只会得到一个「有一半架构起不来」的 .app，而且要等用户打开才发现。
+    #
+    # runner 标签写死到具体版本，**不用 `macos-latest`**：latest 目前指向
+    # macOS 26，且 GitHub 会在 1~2 个月内静默迁移，产物能跑的最低系统版本会
+    # 跟着漂。PyQt5 的 wheel 是 macosx_11_0，眼下还兜得住，但那是巧合不是保证。
+    # `macos-15` 是 arm64，`macos-15-intel` 是 x86_64。
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: ARM             # Apple Silicon
+            machine: arm64
+          - runner: macos-15-intel
+            arch: AMD             # Intel
+            machine: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        # pillow 只是构建期用（把 五子棋.ico 转成 .icns），既不打进产物，
+        # 也不进 requirements.txt —— 运行时不需要它。
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller pillow
+
+      - name: Assert the runner arch matches the label
+        # 这道闸门是必要的。上面的 arch 只写在文件名与 artifact 名里，产物本身
+        # 不自证架构；若 GitHub 在迁移期把 `macos-15-intel` 这个标签悄悄指到
+        # arm64 runner 上，得到的是一个**文件名写着 Intel、实际只能在 Apple
+        # Silicon 上跑**的包，而它在 CI 里一路绿 —— 错到用户双击才暴露。
+        # 所以先断言机器本身，再断言产物。
+        run: |
+          python - <<'PY'
+          import platform, sys
+          m = platform.machine()
+          want = "${{ matrix.machine }}"
+          print("本机 arch: %s / Python %s" % (m, sys.version.split()[0]))
+          assert m == want, "runner 是 %s，标签却要求 %s" % (m, want)
+          PY
+
+      - name: Build .icns from the .ico
+        # macOS 只认 .icns。源图是 Windows 用的那个 .ico（单张 256x256），
+        # 所以 512/1024 两档是放大的 —— 图标在 Dock 里最大只用到 128pt，
+        # 那两档实际用不上，但 iconutil 要求 iconset 是完整的。
+        #
+        # 用 glob 找 .ico 而不是写死 `五子棋.ico`：macOS 的文件系统把非 ASCII
+        # 文件名归一成 NFD，而仓库里存的是 NFC。
+        run: |
+          python - <<'PY'
+          import glob, os
+          from PIL import Image
+
+          src = Image.open(glob.glob("*.ico")[0]).convert("RGBA")
+          sizes = [(16, "icon_16x16.png"), (32, "icon_16x16@2x.png"),
+                   (32, "icon_32x32.png"), (64, "icon_32x32@2x.png"),
+                   (128, "icon_128x128.png"), (256, "icon_128x128@2x.png"),
+                   (256, "icon_256x256.png"), (512, "icon_256x256@2x.png"),
+                   (512, "icon_512x512.png"), (1024, "icon_512x512@2x.png")]
+          os.makedirs("AppIcon.iconset", exist_ok=True)
+          for px, name in sizes:
+              src.resize((px, px), Image.LANCZOS).save(
+                  os.path.join("AppIcon.iconset", name))
+          print("iconset 写出 %d 档，源图 %s" % (len(sizes), src.size))
+          PY
+          iconutil -c icns AppIcon.iconset -o AppIcon.icns
+          ls -lh AppIcon.icns
+
+      - name: Build .app
+        run: |
+          python -m PyInstaller --noconfirm --clean --windowed \
+            --name "GomokuAI" \
+            --osx-bundle-identifier com.iamlinxuhan.gomokuai \
+            --icon AppIcon.icns \
+            main.py
+          # 打出来的必须是 .app **目录**。若退化成裸的可执行文件，双击只会
+          # 开一个终端、应用没有 Dock 图标，而且这一趟 CI 依然全绿。
+          test -d dist/GomokuAI.app
+          ls -l dist/
+
+      - name: Report the minimum macOS version the .app requires
+        # 这个数不由我们决定，由 pip 在**构建机**（macos-15）上挑中哪个 wheel
+        # 决定：numpy 有 macosx_11_0 / 14_0 几档，pip 会挑构建机能跑的最高那一
+        # 档，于是产物能跑的最低系统跟着抬高。只报不断言 —— 它是事实，不是
+        # 不变量；写进 README 的那个数字要以这里的输出为准。
+        run: |
+          EXE="dist/GomokuAI.app/Contents/MacOS/GomokuAI"
+          echo "=== 主可执行文件 ==="
+          vtool -show-build "$EXE"
+          echo "=== 全部二进制的 minos（降序，第一行即整个 .app 的下限）==="
+          { find dist/GomokuAI.app -type f \( -name '*.so' -o -name '*.dylib' \)
+            echo "$EXE"
+          } | while read -r b; do
+            vtool -show-build "$b" 2>/dev/null \
+              | awk -v f="$b" '/minos/{print $2"  "f}'
+          done | sort -rV | head -10
+
+      - name: Show the app as 五子棋AI in Finder and the menu bar
+        # PyInstaller 把 CFBundleName / CFBundleDisplayName 都设成 `--name` 给的
+        # `GomokuAI`。改成中文与 Windows（Inno 的 AppName=五子棋AI）和 Linux
+        # （.desktop 的 Name）对齐。bundle 目录名保持 ASCII，路径好写。
+        #
+        # **改完必须重签**：Info.plist 的内容被计入 bundle 的签名，动它会让
+        # PyInstaller 打的那份 ad-hoc 签名失效，于是应用反而变成"已损坏"。
+        run: |
+          PLIST="dist/GomokuAI.app/Contents/Info.plist"
+          for key in CFBundleName CFBundleDisplayName; do
+            /usr/libexec/PlistBuddy -c "Set :$key 五子棋AI" "$PLIST" 2>/dev/null \
+              || /usr/libexec/PlistBuddy -c "Add :$key string 五子棋AI" "$PLIST"
+          done
+          /usr/libexec/PlistBuddy -c "Print :CFBundleName" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$PLIST"
+          codesign --force --deep --sign - dist/GomokuAI.app
+          codesign --verify --deep --strict dist/GomokuAI.app
+
+      - name: Package .dmg and .pkg
+        shell: bash
+        run: |
+          raw="${GITHUB_REF_NAME}"
+          if [[ "$raw" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+) ]]; then VERSION="${BASH_REMATCH[1]}"
+          elif [[ "$raw" =~ ^[0-9] ]]; then VERSION="$raw"
+          else VERSION="0.0.0-$(date -u +%Y%m%d-%H%M%S)"; fi
+          echo "VERSION=$VERSION"
+          NAME="GomokuAI_For_MacOS_${{ matrix.arch }}"
+
+          # --- .dmg ---
+          # 映像里放 .app 和一个指向 /Applications 的软链，用户打开后把图标
+          # 拖过去即可，**不需要管理员密码**。UDZO = 压缩的只读映像。
+          DMG_ROOT="dmg_root"
+          rm -rf "$DMG_ROOT"
+          mkdir -p "$DMG_ROOT"
+          cp -R dist/GomokuAI.app "$DMG_ROOT/"
+          ln -s /Applications "$DMG_ROOT/Applications"
+          hdiutil create -volname "五子棋AI" -srcfolder "$DMG_ROOT" \
+            -ov -format UDZO "${NAME}.dmg"
+          hdiutil verify "${NAME}.dmg"
+          ls -lh "${NAME}.dmg"
+
+          # --- .pkg ---
+          # 向导式安装器，对标 Windows 那份 Inno Setup。装进 /Applications，
+          # 所以要管理员密码（pkgbuild 只负责把 payload 摆好，认证是安装器
+          # 运行时做的）。--install-location / 配上 root 里的 Applications/
+          # 就是最终落点。
+          PKG_ROOT="pkg_root"
+          rm -rf "$PKG_ROOT"
+          mkdir -p "$PKG_ROOT/Applications"
+          cp -R dist/GomokuAI.app "$PKG_ROOT/Applications/"
+          pkgbuild --root "$PKG_ROOT" \
+            --identifier com.iamlinxuhan.gomokuai \
+            --version "$VERSION" \
+            --install-location / \
+            "${NAME}.pkg"
+          ls -lh "${NAME}.pkg"
+
+      - name: Upload .dmg
+        uses: actions/upload-artifact@v4
+        with:
+          name: GomokuAI_For_MacOS_${{ matrix.arch }}_dmg
+          path: GomokuAI_For_MacOS_${{ matrix.arch }}.dmg
+
+      - name: Upload .pkg
+        uses: actions/upload-artifact@v4
+        with:
+          name: GomokuAI_For_MacOS_${{ matrix.arch }}_pkg
+          path: GomokuAI_For_MacOS_${{ matrix.arch }}.pkg
+
+
+  # ============================================================
   #  GitHub Release (仅 tag 推送时触发)
   # ============================================================
   release:
@@ -383,6 +565,7 @@ jobs:
       - build-windows
       - build-linux-amd
       - build-linux-arm
+      - build-macos
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
